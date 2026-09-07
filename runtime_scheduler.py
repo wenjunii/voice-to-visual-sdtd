@@ -174,6 +174,15 @@ class RealtimeJobScheduler:
         with self._lock:
             self._processed += 1
 
+    def clear(self):
+        """Discard pending work for an explicit reset, preserving run metrics."""
+        with self._lock:
+            discarded = len(self._finals) + int(self._partial is not None)
+            self._finals.clear()
+            self._partial = None
+            self._last_partial_key = None
+            return discarded
+
     def mark_failed(self):
         with self._lock:
             self._failed += 1

@@ -11,6 +11,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Stable Streaming Transcription**: Confirms the word prefix shared by consecutive hypotheses, reducing repeated text and prompt flicker.
 - **Conservative Hallucination Filtering**: Removes standalone Whisper outro artifacts such as “thanks for watching” without discarding real sentences that merely contain similar words.
 - **Rolling Scene Memory**: Removes overlap between audio segments and carries the newest subjects, places, and actions across prompt updates.
+- **Reliable Scene Reset**: Clears buffered and queued speech and ignores older transcription results so a scene reset cannot be undone by work already in progress.
 - **Live Transcription**: Selectable audio-to-text using optimized local GPU **faster-whisper**, the original local GPU **OpenAI Whisper**, online **Groq Whisper** translation, or an experimental Groq turbo + local CPU translation hybrid.
 - **Multilingual Translation**: Automatically translates Chinese, Cantonese, Spanish, and other languages into English in real-time, allowing non-English speakers to control the visual engine seamlessly.
 - **CPU Voice Activity Detection (VAD)**: Silero VAD keeps quiet phonemes, natural pauses, and audio pre-roll without consuming StreamDiffusion's GPU memory. Energy detection remains an automatic fallback.
@@ -398,6 +399,16 @@ Ctrl+C and terminal audio failures signal the audio and transcription workers th
 
 `RUNTIME_SHUTDOWN_GRACE_SECONDS` is an observability threshold rather than a destructive timeout. If a worker is still active after the grace period, the runtime records a `worker_shutdown_overdue` warning with the worker name and continues waiting. This preserves cleanup ordering and avoids closing an HTTP session, model, or log handler while a worker is still using it.
 
+### Resetting a Scene
+
+Send `/control/reset_scene` with any value to begin a fresh scene. Reset clears rolling scene memory, transcript stabilization, buffered speech and pre-roll, queued final segments, pending retries, and the pending partial snapshot. Audio reads already in progress at reset are discarded when they return; subsequent reads can begin new speech. WAV replay continues from its current position.
+
+An already dispatched transcription may finish, but its result cannot restore old text or schedule another attempt for that speech. Backend rate-limit cooldowns still apply to new speech. Reset is serialized with scene updates and prompt publication, so an older prompt cannot be sent after the `/scene_reset` acknowledgement.
+
+The bridge clears `/partial_text` and `/scene_context`, sends `/prompt_tokens` as `0`, then emits `/scene_reset` as `1` and refreshes runtime status. It does not send an empty `/prompt`; use `/scene_reset` in TouchDesigner to clear any displayed text or visuals immediately, or keep the last visual until new speech produces a prompt.
+
+The `scene_memory_reset` log records the number of discarded queued jobs. Late results and errors produce `transcription_scene_discarded` without transcript text. These intentional reset discards do not increase stale/capacity-drop or failed-job counts.
+
 ### OSC Output to TouchDesigner
 
 | Address | Value |
@@ -443,10 +454,10 @@ Send these messages to `127.0.0.1:7001`. Text values accept the names below or t
 | `/control/visual_mode` | `asian_american`, `black_brown`, `asian_black_brown` |
 | `/control/prompt_style` | `human_focus`, `general_scene` |
 | `/control/language` | `en`, `zh`, `es`, `auto` |
-| `/control/reset_scene` | Any value; clears rolling scene memory |
+| `/control/reset_scene` | Any value; clears the scene and pending speech, and invalidates older in-flight transcription |
 | `/control/request_status` | Any value; immediately emits all runtime status addresses |
 
-Accepted changes return `/control_ack`; scene resets additionally emit `/scene_reset`. Gender, age, visual-mode, and prompt-style changes immediately resend `/prompt` using the current scene context. `/control/request_status` includes the five active control modes plus `/prompt_budget_mode` so a TouchDesigner interface can resynchronize after either process restarts.
+Accepted profile changes return `/control_ack`; scene resets emit `/scene_reset` after clearing the scene and pending speech. Gender, age, visual-mode, and prompt-style changes immediately resend `/prompt` using the current scene context. `/control/request_status` includes the five active control modes plus `/prompt_budget_mode` so a TouchDesigner interface can resynchronize after either process restarts.
 
 ## Runtime Structure
 
@@ -483,6 +494,8 @@ Run the streaming logic tests without loading a Whisper model:
 pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
+
+Scene-reset regression tests cover queued and buffered speech, transcription completing across a reset, late retries and failures, audio capture crossing the reset boundary, and concurrent prompt publication. These tests use simulated backends and recorded OSC output without audio hardware or network requests.
 
 Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 

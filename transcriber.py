@@ -434,7 +434,10 @@ class RealTimePipeline:
         )
         self.lock = threading.Lock()
         self.state_lock = threading.Lock()
-        self.scene_lock = threading.Lock()
+        # Acquire scene_lock before the segmenter lock or scheduler lock.
+        # Reentrancy lets scene updates publish and clean up under one boundary.
+        self.scene_lock = threading.RLock()
+        self._scene_generation = 0
         self.runtime_logger.info(
             "Runtime session initialized",
             extra={
@@ -687,7 +690,12 @@ class RealTimePipeline:
             self.config.vad_energy_threshold
         )
 
-    def process_audio_data(self, data):
+    def process_audio_data(self, data, *, scene_generation=None):
+        with self.scene_lock:
+            if scene_generation is None:
+                scene_generation = self._scene_generation
+            if scene_generation != self._scene_generation:
+                return
         audio_data = np.frombuffer(data, dtype=np.int16)
         try:
             is_speech = self.vad.is_speech(audio_data)
@@ -704,20 +712,27 @@ class RealTimePipeline:
             )
             is_speech = self.vad.is_speech(audio_data)
 
-        with self.lock:
-            completed = self.segmenter.add_chunk(audio_data, is_speech)
-            speaking = self.segmenter.active
+        with self.scene_lock:
+            if scene_generation != self._scene_generation:
+                return
+            with self.lock:
+                completed = self.segmenter.add_chunk(audio_data, is_speech)
+                speaking = self.segmenter.active
 
-        if speaking != self.is_speaking:
-            self.is_speaking = speaking
-            self.send_runtime_status(force=True)
+            if speaking != self.is_speaking:
+                self.is_speaking = speaking
+                self.send_runtime_status(force=True)
 
-        now = time.monotonic()
-        for segment in completed:
-            self.submit_final_segment(segment, now, source="completed")
-        self.send_runtime_status()
+            now = time.monotonic()
+            for segment in completed:
+                self.submit_final_segment(segment, now, source="completed")
+            self.send_runtime_status()
 
     def submit_final_segment(self, segment, now, *, source):
+        with self.scene_lock:
+            return self._submit_final_segment_locked(segment, now, source=source)
+
+    def _submit_final_segment_locked(self, segment, now, *, source):
         submission = self.scheduler.submit_final(segment, now)
         dropped_job = submission.dropped_job
         if dropped_job is None:
@@ -749,15 +764,16 @@ class RealTimePipeline:
         return not self.stop_event.wait(max(0.0, delay_seconds))
 
     def finalize_interrupted_audio(self):
-        with self.lock:
-            segment = self.segmenter.interrupt()
-        if segment is None or segment.samples.size == 0:
-            return
-        self.submit_final_segment(
-            segment,
-            time.monotonic(),
-            source="interrupted",
-        )
+        with self.scene_lock:
+            with self.lock:
+                segment = self.segmenter.interrupt()
+            if segment is None or segment.samples.size == 0:
+                return
+            self.submit_final_segment(
+                segment,
+                time.monotonic(),
+                source="interrupted",
+            )
 
     def audio_callback(self):
         reconnect_attempt = 0
@@ -800,6 +816,8 @@ class RealTimePipeline:
 
                 consecutive_read_errors = 0
                 while self.is_running:
+                    with self.scene_lock:
+                        scene_generation = self._scene_generation
                     try:
                         data = source.read()
                     except AudioSourceFinished:
@@ -866,7 +884,9 @@ class RealTimePipeline:
                     consecutive_read_errors = 0
                     reconnect_attempt = 0
                     try:
-                        self.process_audio_data(data)
+                        self.process_audio_data(
+                            data, scene_generation=scene_generation
+                        )
                     except Exception as exc:
                         self.audio_logger.error(
                             "Audio processing failed",
@@ -958,92 +978,116 @@ class RealTimePipeline:
                     break
                 continue
 
-            with self.lock:
-                partial = self.segmenter.snapshot(self.minimum_audio_seconds())
-            if partial is not None:
-                self.scheduler.submit_partial(partial, now)
-
-            job = self.scheduler.next_job(now)
+            with self.scene_lock:
+                with self.lock:
+                    partial = self.segmenter.snapshot(self.minimum_audio_seconds())
+                if partial is not None:
+                    self.scheduler.submit_partial(partial, now)
+                job = self.scheduler.next_job(now)
+                scene_generation = self._scene_generation
+                if job is not None:
+                    self.mark_request_started(now)
+                    self.backend_status = "transcribing"
+                    self.send_runtime_status(force=True)
             if job is None:
                 self.send_runtime_status()
                 if self.stop_event.wait(0.05):
                     break
                 continue
 
-            self.mark_request_started(now)
-            self.backend_status = "transcribing"
-            self.send_runtime_status(force=True)
             started = time.monotonic()
             try:
                 text = self.transcribe_audio(job.segment.samples)
             except RetryableTranscriptionError as exc:
-                self.handle_retryable_failure(job, exc)
+                self.handle_retryable_failure(
+                    job, exc, scene_generation=scene_generation
+                )
                 continue
             except Exception as exc:
-                self.transcription_logger.error(
-                    "Transcription failed",
-                    extra={
-                        "event": "transcription_error",
-                        "error": self.clean_audio_error(exc),
-                        "segment_id": job.segment.segment_id,
-                        "is_final": job.is_final,
-                    },
-                )
-                self.scheduler.mark_failed()
-                self.backend_status = "error"
-                self.cleanup_final_job(job)
-                self.send_runtime_status(force=True)
+                with self.scene_lock:
+                    if self._discard_obsolete_job(job, scene_generation, "error"):
+                        continue
+                    self.transcription_logger.error(
+                        "Transcription failed",
+                        extra={
+                            "event": "transcription_error",
+                            "error": self.clean_audio_error(exc),
+                            "segment_id": job.segment.segment_id,
+                            "is_final": job.is_final,
+                        },
+                    )
+                    self.scheduler.mark_failed()
+                    self.backend_status = "error"
+                    self.cleanup_final_job(job)
+                    self.send_runtime_status(force=True)
                 continue
 
             finished = time.monotonic()
-            self.last_inference_latency = finished - started
-            self.last_total_latency = finished - job.created_at
-            self.scheduler.mark_processed()
-            self.backend_status = "ready"
-            self.backend_retry_not_before = 0.0
-            self.transcription_logger.info(
-                "Transcription completed",
-                extra={
-                    "event": "transcription_completed",
-                    "backend": self.backend,
-                    "segment_id": job.segment.segment_id,
-                    "is_final": job.is_final,
-                    "audio_seconds": (
-                        len(job.segment.samples) / RATE
-                    ),
-                    "latency_asr_seconds": self.last_inference_latency,
-                    "latency_total_seconds": self.last_total_latency,
-                    "character_count": len(text or ""),
-                },
-            )
+            with self.scene_lock:
+                if self._discard_obsolete_job(job, scene_generation, "result"):
+                    continue
+                self._complete_transcription_locked(job, text, started, finished)
 
-            if is_probable_whisper_hallucination(text):
-                text = ""
+    def _discard_obsolete_job(self, job, scene_generation, outcome):
+        """Called under scene_lock before applying an asynchronous result."""
+        if scene_generation is None or scene_generation == self._scene_generation:
+            return False
+        self.backend_status = (
+            "retrying" if time.monotonic() < self.backend_retry_not_before else "ready"
+        )
+        self.transcription_logger.info(
+            "Transcription from before the scene reset discarded",
+            extra={
+                "event": "transcription_scene_discarded",
+                "segment_id": job.segment.segment_id,
+                "scene_generation": scene_generation,
+                "current_scene_generation": self._scene_generation,
+                "outcome": outcome,
+            },
+        )
+        self.send_runtime_status(force=True)
+        return True
 
-            stabilizer = self.stabilizers.setdefault(
+    def _complete_transcription_locked(self, job, text, started, finished):
+        self.last_inference_latency = finished - started
+        self.last_total_latency = finished - job.created_at
+        self.scheduler.mark_processed()
+        self.backend_status = "ready"
+        self.backend_retry_not_before = 0.0
+        self.transcription_logger.info(
+            "Transcription completed",
+            extra={
+                "event": "transcription_completed",
+                "backend": self.backend,
+                "segment_id": job.segment.segment_id,
+                "is_final": job.is_final,
+                "audio_seconds": len(job.segment.samples) / RATE,
+                "latency_asr_seconds": self.last_inference_latency,
+                "latency_total_seconds": self.last_total_latency,
+                "character_count": len(text or ""),
+            },
+        )
+
+        if is_probable_whisper_hallucination(text):
+            text = ""
+        stabilizer = self.stabilizers.setdefault(
+            job.segment.segment_id,
+            TranscriptStabilizer(self.config.transcript_confirm_updates),
+        )
+        update = stabilizer.update(text, is_final=job.is_final)
+        scene_text = ""
+        if update.text:
+            scene_text = self.scene_memory.update(
                 job.segment.segment_id,
-                TranscriptStabilizer(
-                    self.config.transcript_confirm_updates
-                ),
+                update.text,
+                is_final=update.is_final,
             )
-            update = stabilizer.update(text, is_final=job.is_final)
-            scene_text = ""
-            if update.text:
-                with self.scene_lock:
-                    scene_text = self.scene_memory.update(
-                        job.segment.segment_id,
-                        update.text,
-                        is_final=update.is_final,
-                    )
-            if scene_text and (update.changed or update.is_final):
-                self.emit_transcript(
-                    scene_text,
-                    raw_text=update.text,
-                    is_final=update.is_final,
-                )
-
-            self.cleanup_final_job(job)
-            self.send_runtime_status(force=True)
+        if scene_text and (update.changed or update.is_final):
+            self.emit_transcript(
+                scene_text, raw_text=update.text, is_final=update.is_final
+            )
+        self.cleanup_final_job(job)
+        self.send_runtime_status(force=True)
 
     def request_interval_ready(self, now):
         if now < self.backend_retry_not_before:
@@ -1058,7 +1102,11 @@ class RealTimePipeline:
         else:
             self.last_whisper_request_time = now
 
-    def handle_retryable_failure(self, job, exc):
+    def handle_retryable_failure(self, job, exc, *, scene_generation=None):
+        with self.scene_lock:
+            self._handle_retryable_failure_locked(job, exc, scene_generation)
+
+    def _handle_retryable_failure_locked(self, job, exc, scene_generation):
         now = time.monotonic()
         retry_delay = exc.retry_after
         if retry_delay is None:
@@ -1075,6 +1123,9 @@ class RealTimePipeline:
             self.backend_retry_not_before,
             now + retry_delay,
         )
+        # Provider cooldown applies to the endpoint even if its old job was reset.
+        if self._discard_obsolete_job(job, scene_generation, "retry"):
+            return
 
         max_retries = self.config.transcription_final_max_retries
         should_retry = job.is_final and job.attempts < max_retries
@@ -1135,8 +1186,9 @@ class RealTimePipeline:
         self.send_runtime_status(force=True)
 
     def cleanup_final_job(self, job):
-        if job.is_final:
-            self.stabilizers.pop(job.segment.segment_id, None)
+        with self.scene_lock:
+            if job.is_final:
+                self.stabilizers.pop(job.segment.segment_id, None)
 
     def send_osc_message(self, address, value):
         return self.output_publisher.send(address, value)
@@ -1186,13 +1238,16 @@ class RealTimePipeline:
             return self.current_language
 
     def emit_transcript(self, text, raw_text=None, is_final=False):
+        with self.scene_lock:
+            self._emit_transcript_locked(text, raw_text, is_final)
+
+    def _emit_transcript_locked(self, text, raw_text, is_final):
         if not text:
             return
         raw_text = raw_text or text
-        with self.scene_lock:
-            unchanged = text == self.last_text
-            if not unchanged:
-                self.last_text = text
+        unchanged = text == self.last_text
+        if not unchanged:
+            self.last_text = text
         if unchanged:
             if is_final:
                 self.send_osc_message("/transcript_final", raw_text)
@@ -1227,7 +1282,10 @@ class RealTimePipeline:
 
     def refresh_visual_prompt(self):
         with self.scene_lock:
-            text = self.last_text
+            return self._refresh_visual_prompt_locked()
+
+    def _refresh_visual_prompt_locked(self):
+        text = self.last_text
         if not text:
             return False
 
@@ -1459,15 +1517,7 @@ class RealTimePipeline:
             self.send_runtime_status(force=True)
             return
         if control_name == "reset_scene":
-            with self.scene_lock:
-                self.scene_memory.reset()
-                self.last_text = ""
-            self.send_osc_message("/scene_context", "")
-            self.send_osc_message("/scene_reset", 1)
-            self.control_logger.info(
-                "Scene memory reset",
-                extra={"event": "scene_memory_reset"},
-            )
+            self.reset_scene()
             return
 
         valid_values = {
@@ -1511,6 +1561,33 @@ class RealTimePipeline:
         if control_name in {"gender", "age", "visual_mode", "prompt_style"}:
             self.refresh_visual_prompt()
         self.send_runtime_status(force=True)
+
+    def reset_scene(self):
+        with self.scene_lock:
+            self._scene_generation += 1
+            with self.lock:
+                self.segmenter.reset()
+            discarded_jobs = self.scheduler.clear()
+            self.stabilizers.clear()
+            self.scene_memory.reset()
+            self.last_text = ""
+            self.is_speaking = False
+            self.last_prompt_token_count = 0
+            self.last_prompt_variant = "reset"
+            self.last_prompt_trimmed = False
+            self.send_osc_message("/partial_text", "")
+            self.send_osc_message("/scene_context", "")
+            self.send_osc_message("/prompt_tokens", 0)
+            self.send_osc_message("/scene_reset", 1)
+            self.control_logger.info(
+                "Scene memory and pending speech reset",
+                extra={
+                    "event": "scene_memory_reset",
+                    "scene_generation": self._scene_generation,
+                    "discarded_queued_jobs": discarded_jobs,
+                },
+            )
+            self.send_runtime_status(force=True)
 
     def start(self):
         self.start_osc_control_server()
