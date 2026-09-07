@@ -155,6 +155,26 @@ class RealtimeJobSchedulerTests(unittest.TestCase):
         ):
             RealtimeJobScheduler(final_overflow_policy="discard_random")
 
+    def test_clear_removes_finals_retries_and_partials_without_capacity_drops(self):
+        scheduler = RealtimeJobScheduler()
+        scheduler.submit_final(make_segment(1, 1, is_final=True), now=1.0)
+        job = scheduler.next_job(now=1.0)
+        scheduler.retry_final(job, now=1.1, delay_seconds=10.0)
+        scheduler.submit_final(make_segment(2, 1, is_final=True), now=1.2)
+        partial = make_segment(3, 1)
+        scheduler.submit_partial(partial, now=1.3)
+
+        self.assertEqual(scheduler.clear(), 3)
+        self.assertIsNone(scheduler.next_job(now=1.4))
+        self.assertIsNone(scheduler.next_job(now=12.0))
+        metrics = scheduler.metrics()
+        self.assertEqual(metrics.submitted_finals, 2)
+        self.assertEqual(metrics.retries, 1)
+        self.assertEqual(metrics.dropped_finals, 0)
+        self.assertEqual(metrics.dropped_stale, 0)
+        self.assertEqual(scheduler.clear(), 0)
+        self.assertIsNotNone(scheduler.submit_partial(partial, now=12.1))
+
 
 if __name__ == "__main__":
     unittest.main()

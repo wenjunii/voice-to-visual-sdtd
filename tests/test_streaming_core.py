@@ -85,6 +85,24 @@ class AudioSegmenterTests(unittest.TestCase):
         )
 
 
+    def test_reset_discards_active_audio_and_pre_roll_without_reusing_ids(self):
+        segmenter = self.make_segmenter()
+        segmenter.add_chunk(np.array([1, 1], dtype=np.int16), False)
+        segmenter.add_chunk(np.array([2, 2], dtype=np.int16), True)
+        previous_id = segmenter.snapshot().segment_id
+
+        self.assertIsNone(segmenter.reset())
+        self.assertFalse(segmenter.active)
+        self.assertIsNone(segmenter.snapshot())
+
+        segmenter.add_chunk(np.array([3, 3], dtype=np.int16), False)
+        segmenter.reset()
+        segmenter.add_chunk(np.array([4, 4], dtype=np.int16), True)
+        snapshot = segmenter.snapshot()
+        self.assertGreater(snapshot.segment_id, previous_id)
+        np.testing.assert_array_equal(snapshot.samples, [4, 4])
+
+
 class TranscriptStabilizerTests(unittest.TestCase):
     def test_confirms_shared_prefix_across_two_updates(self):
         stabilizer = TranscriptStabilizer(agreement_updates=2)

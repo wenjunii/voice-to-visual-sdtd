@@ -112,9 +112,13 @@ class AudioSegmenter:
         """Finalize active speech and clear device-specific pre-roll after an input outage."""
 
         completed = self._snapshot(is_final=True) if self._active else None
+        self.reset()
+        return completed
+
+    def reset(self):
+        """Discard buffered speech and pre-roll without reusing segment IDs."""
         self._reset_active()
         self._pre_roll.clear()
-        return completed
 
     def _snapshot(self, is_final):
         if not self._active_chunks:
