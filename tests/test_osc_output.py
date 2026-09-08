@@ -19,7 +19,7 @@ def make_snapshot(**changes):
         "latency_total": 0.5,
         "latency_asr": 0.25,
         "retry_in": 1.5,
-        "dropped_jobs": 3,
+        "dropped_jobs": 7,
         "audio_status": "ready",
         "audio_source": "wav_replay",
         "audio_reconnects": 1,
@@ -34,6 +34,7 @@ def make_snapshot(**changes):
         "prompt_budget_mode": "exact",
         "dropped_final_oldest": 2,
         "dropped_final_newest": 1,
+        "dropped_expired_results": 4,
     }
     values.update(changes)
     return RuntimeStatusSnapshot(**values)
@@ -68,10 +69,12 @@ class RuntimeStatusSnapshotTests(unittest.TestCase):
                 "/prompt_budget_mode",
                 "/dropped_final_oldest",
                 "/dropped_final_newest",
+                "/dropped_expired_results",
             ],
         )
         self.assertEqual(messages[2], OscMessage("/is_speaking", 1))
         self.assertEqual(messages[4], OscMessage("/latency_total", 0.5))
+        self.assertEqual(messages[-1], OscMessage("/dropped_expired_results", 4))
 
 
 class OscOutputPublisherTests(unittest.TestCase):
@@ -110,7 +113,7 @@ class OscOutputPublisherTests(unittest.TestCase):
         self.assertTrue(
             publisher.publish_status(make_snapshot(), force=True)
         )
-        self.assertEqual(client.send_message.call_count, 44)
+        self.assertEqual(client.send_message.call_count, 46)
 
     def test_delivery_errors_are_isolated_rate_limited_and_recoverable(self):
         client = Mock()

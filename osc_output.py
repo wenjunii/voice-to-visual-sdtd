@@ -35,6 +35,7 @@ class RuntimeStatusSnapshot:
     prompt_budget_mode: str
     dropped_final_oldest: int
     dropped_final_newest: int
+    dropped_expired_results: int = 0
 
     def messages(self):
         return (
@@ -60,6 +61,7 @@ class RuntimeStatusSnapshot:
             OscMessage("/prompt_budget_mode", self.prompt_budget_mode),
             OscMessage("/dropped_final_oldest", self.dropped_final_oldest),
             OscMessage("/dropped_final_newest", self.dropped_final_newest),
+            OscMessage("/dropped_expired_results", self.dropped_expired_results),
         )
 
 

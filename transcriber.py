@@ -1049,11 +1049,30 @@ class RealTimePipeline:
         return True
 
     def _complete_transcription_locked(self, job, text, started, finished):
+        # Include time spent waiting to reacquire scene_lock before applying text.
+        result_time = time.monotonic()
         self.last_inference_latency = finished - started
-        self.last_total_latency = finished - job.created_at
-        self.scheduler.mark_processed()
+        self.last_total_latency = result_time - job.created_at
         self.backend_status = "ready"
         self.backend_retry_not_before = 0.0
+        if not self.scheduler.complete_job(job, result_time):
+            self.cleanup_final_job(job)
+            self.transcription_logger.warning(
+                "Transcription result exceeded its age limit and was discarded",
+                extra={
+                    "event": "transcription_result_expired",
+                    "backend": self.backend,
+                    "job_id": job.job_id,
+                    "segment_id": job.segment.segment_id,
+                    "is_final": job.is_final,
+                    "attempt": job.attempts + 1,
+                    "result_age_seconds": self.last_total_latency,
+                    "max_age_seconds": self.scheduler.max_age_seconds(job),
+                    "latency_asr_seconds": self.last_inference_latency,
+                },
+            )
+            self.send_runtime_status(force=True)
+            return
         self.transcription_logger.info(
             "Transcription completed",
             extra={
@@ -1227,6 +1246,7 @@ class RealTimePipeline:
             prompt_budget_mode=self.prompt_budget_mode,
             dropped_final_oldest=metrics.dropped_final_oldest,
             dropped_final_newest=metrics.dropped_final_newest,
+            dropped_expired_results=metrics.dropped_expired_results,
         )
         return self.output_publisher.publish_status(
             snapshot,
@@ -1692,6 +1712,9 @@ class RealTimePipeline:
                         ),
                         "dropped_final_newest": (
                             metrics.dropped_final_newest
+                        ),
+                        "dropped_expired_results": (
+                            metrics.dropped_expired_results
                         ),
                     },
                 )

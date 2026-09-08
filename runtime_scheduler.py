@@ -49,6 +49,7 @@ class SchedulerMetrics:
     retries: int
     processed: int
     failed: int
+    dropped_expired_results: int = 0
 
 
 class RealtimeJobScheduler:
@@ -81,6 +82,7 @@ class RealtimeJobScheduler:
         self._submitted_partials = 0
         self._replaced_partials = 0
         self._dropped_stale = 0
+        self._dropped_expired_results = 0
         self._dropped_final_oldest = 0
         self._dropped_final_newest = 0
         self._retries = 0
@@ -174,6 +176,16 @@ class RealtimeJobScheduler:
         with self._lock:
             self._processed += 1
 
+    def complete_job(self, job, now):
+        """Record one completed attempt; return whether its result is still fresh."""
+        with self._lock:
+            if self._is_stale(job, now):
+                self._dropped_stale += 1
+                self._dropped_expired_results += 1
+                return False
+            self._processed += 1
+            return True
+
     def clear(self):
         """Discard pending work for an explicit reset, preserving run metrics."""
         with self._lock:
@@ -208,6 +220,7 @@ class RealtimeJobScheduler:
                 retries=self._retries,
                 processed=self._processed,
                 failed=self._failed,
+                dropped_expired_results=self._dropped_expired_results,
             )
 
     def _new_job(self, segment, now):
@@ -245,8 +258,15 @@ class RealtimeJobScheduler:
             self._partial = None
             self._dropped_stale += 1
 
+    def max_age_seconds(self, job):
+        return (
+            self.final_max_age_seconds
+            if job.is_final
+            else self.partial_max_age_seconds
+        )
+
     def _is_stale(self, job, now):
-        max_age = self.final_max_age_seconds if job.is_final else self.partial_max_age_seconds
+        max_age = self.max_age_seconds(job)
         return max_age > 0 and now - job.created_at > max_age
 
 
