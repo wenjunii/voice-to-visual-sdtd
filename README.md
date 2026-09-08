@@ -20,6 +20,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Audio Source Adapters & WAV Replay**: Keeps microphone ownership outside the pipeline and can replay a recording through the real VAD, segmentation, scheduling, transcription, prompt, logging, and OSC path without audio hardware.
 - **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
 - **Freshness-First Backpressure**: Final speech is prioritized in a bounded queue, obsolete partial snapshots are replaced, and the default overflow policy evicts the oldest pending final so visuals follow the newest spoken intent.
+- **Transcription Result Age Limits**: Discards results that become too old during queueing or transcription before they can change scene memory or send an outdated visual prompt.
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
 - **Isolated Backend Adapters**: Local Whisper, faster-whisper, Groq, hybrid translation, and Google each own their model or API contract, timing limits, and resource cleanup behind one runtime interface.
 - **Backend Dependency Profiles**: Install only the shared bridge packages and the selected transcription backend instead of pulling every CUDA, cloud, translation, and visual runtime into one environment.
@@ -180,6 +181,7 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
     TRANSCRIPTION_MAX_FINAL_JOBS=8
     # drop_oldest favors live visual freshness; drop_newest preserves queued FIFO history.
     TRANSCRIPTION_FINAL_OVERFLOW_POLICY=drop_oldest
+    # Applies to queued jobs and completed results. Set either to 0 to disable that limit.
     TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS=4.0
     TRANSCRIPTION_FINAL_MAX_AGE_SECONDS=30.0
     TRANSCRIPTION_FINAL_MAX_RETRIES=2
@@ -370,6 +372,12 @@ Replay accepts mono or multichannel PCM input at any valid sample rate. It conve
 
 An older transcription retry never evicts newer queued speech under either policy. Stale jobs, oldest capacity drops, and newest capacity drops are counted separately; `/dropped_jobs` remains the backward-compatible total. Structured scheduler logs identify the dropped segment, incoming segment, source, and active policy.
 
+`TRANSCRIPTION_PARTIAL_MAX_AGE_SECONDS` (default `4.0`) and `TRANSCRIPTION_FINAL_MAX_AGE_SECONDS` (default `30.0`) apply both in the queue and when a completed result is about to update the scene. Age starts at the job's original scheduler submission and includes queue time, transcription, retries, and any wait before applying the result. Results exactly at the limit are accepted; older results are discarded before transcript stabilization, scene-memory changes, or prompt output. Setting either limit to `0` disables that limit for that job type.
+
+These are freshness limits, not request-cancellation timeouts: a model or API call can finish safely, and the pipeline can continue with fresh speech. Increase the limits if your backend routinely takes longer, or set them to `0` when retaining slow results matters more than live freshness, such as during WAV replay. They do not measure time from the start of audio capture.
+
+`/dropped_expired_results` counts completed results rejected for age. It is a subset of stale drops and is already included once in `/dropped_jobs`; it is not a backend-failure count. The `transcription_result_expired` log includes result age, configured limit, ASR latency, and job identifiers without transcript text. Latency status also updates for discarded results so backend slowdowns remain visible. A scene reset takes precedence over age expiry and keeps its separate intentional-discard behavior.
+
 ### Prompt Budgeting Modes
 
 With `PROMPT_TOKEN_BUDGET_ENABLED=true`, the runtime first loads every model in `PROMPT_TOKENIZER_MODELS`. When they are available, `exact` mode measures the prompt against both SDXL CLIP tokenizers. If an import, download, or cache error occurs, the default `PROMPT_TOKEN_BUDGET_FALLBACK=conservative` mode uses a UTF-8 byte upper bound for CLIP's byte-level tokenization, including its two boundary tokens. This fallback can select a minimal prompt variant and retain the newest transcript suffix without network or model files.
@@ -423,12 +431,13 @@ The `scene_memory_reset` log records the number of discarded queued jobs. Late r
 | `/backend` | Active transcription backend |
 | `/is_speaking` | `1` while VAD detects an active speech segment, otherwise `0` |
 | `/queue_depth` | Pending final jobs plus the newest pending partial |
-| `/latency_total` | Seconds from scheduler submission through completed transcription |
+| `/latency_total` | Seconds from scheduler submission until result handling, including queueing, transcription, and waiting to apply the result |
 | `/latency_asr` | Seconds spent in the active ASR/translation call |
 | `/retry_in` | Seconds until a rate-limited or transiently unavailable backend may be called again |
 | `/dropped_jobs` | Total stale or capacity-dropped jobs |
 | `/dropped_final_oldest` | Oldest finals or retries discarded at queue capacity |
 | `/dropped_final_newest` | Incoming finals rejected at queue capacity |
+| `/dropped_expired_results` | Completed results discarded for age; already included in `/dropped_jobs` |
 | `/audio_status` | `starting`, `ready`, `degraded`, `reconnecting`, `error`, or `stopped` |
 | `/audio_source` | `microphone` or `wav_replay` |
 | `/audio_reconnects` | Total microphone reopen attempts during this run |
@@ -441,7 +450,7 @@ The `scene_memory_reset` log records the number of discarded queued jobs. Late r
 | `/prompt_style` | Active human-focus or general-scene mode |
 | `/language` | Active language code or `auto` |
 
-Status is captured as one immutable runtime snapshot before it is serialized in the stable address order above. Individual UDP send failures are contained at the output boundary, so they do not stop the audio or transcription workers.
+Status is captured as one immutable runtime snapshot before serialization. Existing status addresses retain their wire order, and new status counters are appended. Individual UDP send failures are contained at the output boundary, so they do not stop the audio or transcription workers.
 
 ### OSC Input from TouchDesigner
 
@@ -496,6 +505,8 @@ python -m unittest discover -s tests -v
 ```
 
 Scene-reset regression tests cover queued and buffered speech, transcription completing across a reset, late retries and failures, audio capture crossing the reset boundary, and concurrent prompt publication. These tests use simulated backends and recorded OSC output without audio hardware or network requests.
+
+Result-age tests use a simulated clock to cover slow partial and final results, exact-limit acceptance, disabled limits, queue and retry time, discard telemetry, scene-reset precedence, and recovery with fresh speech.
 
 Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 

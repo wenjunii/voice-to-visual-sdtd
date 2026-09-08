@@ -264,6 +264,7 @@ class RealTimePipelineControlTests(unittest.TestCase):
             ("/prompt_budget_mode", "disabled"),
             ("/dropped_final_oldest", 0),
             ("/dropped_final_newest", 0),
+            ("/dropped_expired_results", 0),
         }
         calls = {
             (message.address, message.value)

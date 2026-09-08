@@ -175,6 +175,66 @@ class RealtimeJobSchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.clear(), 0)
         self.assertIsNotNone(scheduler.submit_partial(partial, now=12.1))
 
+    def test_result_age_limits_accept_boundary_and_reject_older_results(self):
+        for is_final, limit in ((False, 4.0), (True, 30.0)):
+            for age, accepted in ((limit - 0.1, True), (limit, True), (limit + 0.1, False)):
+                with self.subTest(is_final=is_final, age=age):
+                    scheduler = RealtimeJobScheduler()
+                    submit = scheduler.submit_final if is_final else scheduler.submit_partial
+                    submit(make_segment(1, 1, is_final=is_final), now=100.0)
+                    job = scheduler.next_job(now=100.0)
+
+                    self.assertEqual(scheduler.complete_job(job, 100.0 + age), accepted)
+                    metrics = scheduler.metrics(now=200.0)
+                    self.assertEqual(metrics.processed, int(accepted))
+                    self.assertEqual(metrics.dropped_stale, int(not accepted))
+                    self.assertEqual(metrics.dropped_expired_results, int(not accepted))
+                    self.assertEqual(metrics.failed, 0)
+
+    def test_zero_disables_only_the_selected_job_types_age_limit(self):
+        for unlimited_final in (False, True):
+            with self.subTest(unlimited_final=unlimited_final):
+                scheduler = RealtimeJobScheduler(
+                    final_max_age_seconds=0 if unlimited_final else 1,
+                    partial_max_age_seconds=1 if unlimited_final else 0,
+                )
+                scheduler.submit_final(make_segment(1, 1, is_final=True), now=1.0)
+                scheduler.submit_partial(make_segment(2, 1), now=1.0)
+                final = scheduler.next_job(now=1.0)
+                partial = scheduler.next_job(now=1.0)
+
+                self.assertEqual(scheduler.complete_job(final, 1000.0), unlimited_final)
+                self.assertEqual(scheduler.complete_job(partial, 1000.0), not unlimited_final)
+                self.assertEqual(scheduler.metrics().dropped_expired_results, 1)
+
+    def test_successful_retry_keeps_the_original_submission_deadline(self):
+        scheduler = RealtimeJobScheduler()
+        scheduler.submit_final(make_segment(1, 1, is_final=True), now=100.0)
+        original = scheduler.next_job(now=100.0)
+        self.assertTrue(scheduler.retry_final(original, now=110.0, delay_seconds=2.0))
+        retry = scheduler.next_job(now=112.0)
+
+        self.assertEqual(retry.created_at, 100.0)
+        self.assertFalse(scheduler.complete_job(retry, now=131.0))
+        metrics = scheduler.metrics()
+        self.assertEqual(metrics.retries, 1)
+        self.assertEqual(metrics.processed, 0)
+        self.assertEqual(metrics.dropped_expired_results, 1)
+
+    def test_expired_result_counter_is_a_subset_of_total_stale_drops(self):
+        scheduler = RealtimeJobScheduler(final_max_age_seconds=2.0)
+        scheduler.submit_final(make_segment(1, 1, is_final=True), now=100.0)
+        running_job = scheduler.next_job(now=100.0)
+        scheduler.submit_final(make_segment(2, 1, is_final=True), now=100.0)
+
+        self.assertFalse(scheduler.complete_job(running_job, now=103.0))
+        metrics = scheduler.metrics(now=103.0)
+        self.assertEqual(metrics.dropped_stale, 2)
+        self.assertEqual(metrics.dropped_expired_results, 1)
+        self.assertEqual(metrics.dropped_finals, 0)
+        scheduler.clear()
+        self.assertEqual(scheduler.metrics(), metrics)
+
 
 if __name__ == "__main__":
     unittest.main()
