@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 
@@ -147,6 +148,70 @@ class RealtimeJobSchedulerTests(unittest.TestCase):
         metrics = scheduler.metrics()
         self.assertEqual(metrics.dropped_finals, 0)
         self.assertEqual(metrics.dropped_stale, 2)
+
+    def test_all_purge_paths_notify_queued_final_expiry_once_after_unlocking(self):
+        for operation in ("submit", "dispatch", "retry", "metrics"):
+            with self.subTest(operation=operation):
+                notifications = []
+
+                def expired(segment_id):
+                    # Fail promptly instead of deadlocking if callbacks move
+                    # inside the scheduler lock. Reentrant reads must be safe.
+                    self.assertTrue(scheduler._lock.acquire(blocking=False))
+                    scheduler._lock.release()
+                    notifications.append((segment_id, scheduler.metrics().dropped_stale))
+
+                scheduler = RealtimeJobScheduler(
+                    partial_max_age_seconds=1.0,
+                    final_max_age_seconds=1.0,
+                    on_final_expired=expired,
+                )
+                scheduler.submit_final(make_segment(9, 1, is_final=True), now=1.0)
+                in_flight = scheduler.next_job(now=1.0)
+                scheduler.submit_final(make_segment(1, 1, is_final=True), now=1.0)
+                scheduler.submit_partial(make_segment(2, 1), now=1.0)
+
+                if operation == "submit":
+                    scheduler.submit_final(make_segment(3, 1, is_final=True), now=3.0)
+                elif operation == "dispatch":
+                    self.assertIsNone(scheduler.next_job(now=3.0))
+                elif operation == "retry":
+                    self.assertFalse(scheduler.retry_final(in_flight, now=3.0, delay_seconds=1))
+                else:
+                    scheduler.metrics(now=3.0)
+
+                # The retry rejection has its own caller-owned cleanup path.
+                expected_stale = 3 if operation == "retry" else 2
+                self.assertEqual(notifications, [(1, expected_stale)])
+                scheduler.metrics(now=3.0)
+                self.assertEqual(notifications, [(1, expected_stale)])
+                self.assertEqual(scheduler.metrics().dropped_expired_results, 0)
+
+    def test_expiry_notifications_cover_every_final_but_not_partials(self):
+        expired = Mock()
+        scheduler = RealtimeJobScheduler(on_final_expired=expired)
+        for segment_id in range(1, 4):
+            scheduler.submit_final(make_segment(segment_id, 1, is_final=True), now=100.0)
+        scheduler.submit_partial(make_segment(4, 1), now=100.0)
+
+        scheduler.metrics(now=131.0)
+
+        self.assertEqual([call.args for call in expired.call_args_list], [(1,), (2,), (3,)])
+        self.assertEqual(scheduler.metrics().dropped_stale, 4)
+
+    def test_fresh_unlimited_and_reset_jobs_do_not_notify_expiry(self):
+        for limit, now in ((30.0, 130.0), (0.0, 1000.0)):
+            with self.subTest(limit=limit):
+                expired = Mock()
+                scheduler = RealtimeJobScheduler(
+                    final_max_age_seconds=limit, on_final_expired=expired
+                )
+                scheduler.submit_final(make_segment(1, 1, is_final=True), now=100.0)
+                self.assertEqual(scheduler.metrics(now=now).queue_depth, 1)
+                scheduler.clear()
+                scheduler.metrics(now=1001.0)
+                expired.assert_not_called()
+                self.assertEqual(scheduler.metrics().dropped_stale, 0)
 
     def test_rejects_unknown_overflow_policy(self):
         with self.assertRaisesRegex(

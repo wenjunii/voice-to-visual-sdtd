@@ -398,8 +398,11 @@ class RealTimePipeline:
             final_max_age_seconds=(
                 self.config.transcription_final_max_age_seconds
             ),
+            on_final_expired=self._on_queued_final_expired,
         )
         self.stabilizers = {}
+        self._inflight_segment_id = None
+        self._inflight_segment_discarded = False
         self.scene_memory = RollingSceneMemory(
             max_words=self.config.scene_memory_max_words,
             max_age_seconds=self.config.scene_memory_max_age_seconds,
@@ -986,6 +989,8 @@ class RealTimePipeline:
                 job = self.scheduler.next_job(now)
                 scene_generation = self._scene_generation
                 if job is not None:
+                    self._inflight_segment_id = job.segment.segment_id
+                    self._inflight_segment_discarded = False
                     self.mark_request_started(now)
                     self.backend_status = "transcribing"
                     self.send_runtime_status(force=True)
@@ -995,6 +1000,10 @@ class RealTimePipeline:
                     break
                 continue
 
+            self._run_transcription_job(job, scene_generation)
+
+    def _run_transcription_job(self, job, scene_generation):
+        try:
             started = time.monotonic()
             try:
                 text = self.transcribe_audio(job.segment.samples)
@@ -1002,11 +1011,11 @@ class RealTimePipeline:
                 self.handle_retryable_failure(
                     job, exc, scene_generation=scene_generation
                 )
-                continue
+                return
             except Exception as exc:
                 with self.scene_lock:
                     if self._discard_obsolete_job(job, scene_generation, "error"):
-                        continue
+                        return
                     self.transcription_logger.error(
                         "Transcription failed",
                         extra={
@@ -1020,13 +1029,21 @@ class RealTimePipeline:
                     self.backend_status = "error"
                     self.cleanup_final_job(job)
                     self.send_runtime_status(force=True)
-                continue
+                return
 
             finished = time.monotonic()
             with self.scene_lock:
                 if self._discard_obsolete_job(job, scene_generation, "result"):
-                    continue
+                    return
                 self._complete_transcription_locked(job, text, started, finished)
+        finally:
+            with self.scene_lock:
+                # A queued final may be discarded while its partial is running.
+                # Do not leave state recreated by that partial's eventual result.
+                if self._inflight_segment_discarded:
+                    self.stabilizers.pop(job.segment.segment_id, None)
+                self._inflight_segment_id = None
+                self._inflight_segment_discarded = False
 
     def _discard_obsolete_job(self, job, scene_generation, outcome):
         """Called under scene_lock before applying an asynchronous result."""
@@ -1207,7 +1224,24 @@ class RealTimePipeline:
     def cleanup_final_job(self, job):
         with self.scene_lock:
             if job.is_final:
-                self.stabilizers.pop(job.segment.segment_id, None)
+                self._cleanup_segment_state_locked(job.segment.segment_id)
+
+    def _cleanup_segment_state_locked(self, segment_id):
+        self.stabilizers.pop(segment_id, None)
+        if segment_id == self._inflight_segment_id:
+            self._inflight_segment_discarded = True
+
+    def _on_queued_final_expired(self, segment_id):
+        # The scheduler releases its lock before invoking this callback.
+        with self.scene_lock:
+            self._cleanup_segment_state_locked(segment_id)
+            self.scheduler_logger.info(
+                "Expired queued final released its transcript state",
+                extra={
+                    "event": "scheduler_final_expired",
+                    "segment_id": segment_id,
+                },
+            )
 
     def send_osc_message(self, address, value):
         return self.output_publisher.send(address, value)
