@@ -1,5 +1,6 @@
 import threading
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -61,6 +62,7 @@ class RealtimeJobScheduler:
         final_overflow_policy="drop_oldest",
         partial_max_age_seconds=4.0,
         final_max_age_seconds=30.0,
+        on_final_expired=None,
     ):
         if max_final_jobs < 1:
             raise ValueError("max_final_jobs must be positive")
@@ -73,6 +75,7 @@ class RealtimeJobScheduler:
         self.final_overflow_policy = final_overflow_policy
         self.partial_max_age_seconds = partial_max_age_seconds
         self.final_max_age_seconds = final_max_age_seconds
+        self._on_final_expired = on_final_expired
         self._finals = deque()
         self._partial = None
         self._last_partial_key = None
@@ -90,8 +93,7 @@ class RealtimeJobScheduler:
         self._failed = 0
 
     def submit_final(self, segment, now):
-        with self._lock:
-            self._purge_stale_locked(now)
+        with self._expire_before(now):
             if (
                 self._partial is not None
                 and self._partial.segment.segment_id == segment.segment_id
@@ -132,8 +134,7 @@ class RealtimeJobScheduler:
             return job
 
     def next_job(self, now):
-        with self._lock:
-            self._purge_stale_locked(now)
+        with self._expire_before(now):
             for index, job in enumerate(self._finals):
                 if job.ready_at <= now:
                     del self._finals[index]
@@ -147,8 +148,7 @@ class RealtimeJobScheduler:
     def retry_final(self, job, now, delay_seconds):
         if not job.is_final:
             return FinalJobSubmission(job=None)
-        with self._lock:
-            self._purge_stale_locked(now)
+        with self._expire_before(now):
             if self._is_stale(job, now):
                 self._dropped_stale += 1
                 return FinalJobSubmission(
@@ -200,9 +200,7 @@ class RealtimeJobScheduler:
             self._failed += 1
 
     def metrics(self, now=None):
-        with self._lock:
-            if now is not None:
-                self._purge_stale_locked(now)
+        with self._expire_before(now):
             return SchedulerMetrics(
                 queue_depth=len(self._finals) + int(self._partial is not None),
                 final_queue_depth=len(self._finals),
@@ -245,11 +243,31 @@ class RealtimeJobScheduler:
         del self._finals[oldest_index]
         return dropped_job
 
+    @contextmanager
+    def _expire_before(self, now):
+        """Notify queued-final expiry after unlocking, including early returns.
+
+        Only segment IDs are passed to the synchronous callback; no discarded
+        audio or notification backlog is retained by the scheduler.
+        """
+        expired_final_ids = []
+        try:
+            with self._lock:
+                if now is not None:
+                    expired_final_ids = self._purge_stale_locked(now)
+                yield
+        finally:
+            if self._on_final_expired is not None:
+                for segment_id in expired_final_ids:
+                    self._on_final_expired(segment_id)
+
     def _purge_stale_locked(self, now):
+        expired_final_ids = []
         retained = deque()
         for job in self._finals:
             if self._is_stale(job, now):
                 self._dropped_stale += 1
+                expired_final_ids.append(job.segment.segment_id)
             else:
                 retained.append(job)
         self._finals = retained
@@ -257,6 +275,7 @@ class RealtimeJobScheduler:
         if self._partial is not None and self._is_stale(self._partial, now):
             self._partial = None
             self._dropped_stale += 1
+        return expired_final_ids
 
     def max_age_seconds(self, job):
         return (

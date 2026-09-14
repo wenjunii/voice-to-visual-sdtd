@@ -20,7 +20,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Audio Source Adapters & WAV Replay**: Keeps microphone ownership outside the pipeline and can replay a recording through the real VAD, segmentation, scheduling, transcription, prompt, logging, and OSC path without audio hardware.
 - **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
 - **Freshness-First Backpressure**: Final speech is prioritized in a bounded queue, obsolete partial snapshots are replaced, and the default overflow policy evicts the oldest pending final so visuals follow the newest spoken intent.
-- **Transcription Result Age Limits**: Discards results that become too old during queueing or transcription before they can change scene memory or send an outdated visual prompt.
+- **Transcription Age Limits and Cleanup**: Discards results that become too old during queueing or transcription and releases expired queued segments' transcript state for long-running sessions.
 - **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
 - **Isolated Backend Adapters**: Local Whisper, faster-whisper, Groq, hybrid translation, and Google each own their model or API contract, timing limits, and resource cleanup behind one runtime interface.
 - **Backend Dependency Profiles**: Install only the shared bridge packages and the selected transcription backend instead of pulling every CUDA, cloud, translation, and visual runtime into one environment.
@@ -376,6 +376,10 @@ An older transcription retry never evicts newer queued speech under either polic
 
 These are freshness limits, not request-cancellation timeouts: a model or API call can finish safely, and the pipeline can continue with fresh speech. Increase the limits if your backend routinely takes longer, or set them to `0` when retaining slow results matters more than live freshness, such as during WAV replay. They do not measure time from the start of audio capture.
 
+Expired queued finals also release their per-segment transcript-stabilization state, including retries waiting through a backend cooldown. Cleanup happens whenever expiry is discovered: queue admission, dispatch, retry scheduling, status checks, or replay completion. Expiring a partial alone preserves its segment's state for later updates and the eventual final. If a partial is already running when its final expires or is capacity-dropped, any state it recreates is cleaned up when that attempt ends; the existing result-age limits still decide whether its text can be used. Cleanup does not erase previously accepted scene memory or change drop counters.
+
+The `scheduler_final_expired` log records the expired queued final's segment ID without transcript text. Expiry notifications run synchronously outside the scheduler lock and retain neither discarded audio nor a notification backlog.
+
 `/dropped_expired_results` counts completed results rejected for age. It is a subset of stale drops and is already included once in `/dropped_jobs`; it is not a backend-failure count. The `transcription_result_expired` log includes result age, configured limit, ASR latency, and job identifiers without transcript text. Latency status also updates for discarded results so backend slowdowns remain visible. A scene reset takes precedence over age expiry and keeps its separate intentional-discard behavior.
 
 ### Prompt Budgeting Modes
@@ -478,7 +482,7 @@ Accepted profile changes return `/control_ack`; scene resets emit `/scene_reset`
 - `runtime_config.py` loads, types, validates, and safely reports environment-backed configuration.
 - `runtime_logging.py` owns session IDs, subsystem context, credential redaction, human console formatting, and rotating JSON Lines files.
 - `audio_runtime.py` owns CPU voice activity detectors.
-- `runtime_scheduler.py` owns configurable freshness/FIFO overflow handling, bounded final/partial scheduling, retry protection, and queue metrics.
+- `runtime_scheduler.py` owns configurable freshness/FIFO overflow handling, bounded final/partial scheduling, retry protection, queued-final expiry notifications, and queue metrics.
 - `backend_errors.py` owns retry timing and `Retry-After` parsing.
 - `osc_output.py` owns the immutable runtime-status protocol, thread-safe UDP delivery, outage/recovery logging, and in-memory test publisher.
 - `osc_control.py` owns the TouchDesigner control server and control aliases.
@@ -507,6 +511,8 @@ python -m unittest discover -s tests -v
 Scene-reset regression tests cover queued and buffered speech, transcription completing across a reset, late retries and failures, audio capture crossing the reset boundary, and concurrent prompt publication. These tests use simulated backends and recorded OSC output without audio hardware or network requests.
 
 Result-age tests use a simulated clock to cover slow partial and final results, exact-limit acceptance, disabled limits, queue and retry time, discard telemetry, scene-reset precedence, and recovery with fresh speech.
+
+Queue-expiry cleanup tests cover repeated expiry after accepted partials, retry cooldowns, replay completion, preservation of unrelated and active partial state, and partial results or failures arriving after their final was discarded. Scheduler tests verify exactly-once notifications on every purge path, callbacks outside the scheduler lock, and unchanged boundary, disabled-limit, and reset behavior.
 
 Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 
