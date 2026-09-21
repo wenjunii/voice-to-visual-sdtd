@@ -23,6 +23,8 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.osc_port, 7000)
         self.assertTrue(config.osc_control_enabled)
         self.assertEqual(config.osc_output_error_log_interval, 5.0)
+        self.assertEqual(config.osc_prompt_retry_base_seconds, 0.5)
+        self.assertEqual(config.osc_prompt_retry_max_seconds, 5.0)
         self.assertEqual(config.runtime_log_level, "info")
         self.assertTrue(config.runtime_log_console_enabled)
         self.assertEqual(config.runtime_log_file, "")
@@ -67,6 +69,27 @@ class RuntimeConfigTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(environment_names), len(set(environment_names)))
+
+    def test_loads_and_validates_prompt_retry_intervals(self):
+        config = RuntimeConfig.from_environment({
+            "OSC_PROMPT_RETRY_BASE_SECONDS": "0.25",
+            "OSC_PROMPT_RETRY_MAX_SECONDS": "2.0",
+        })
+        self.assertEqual(config.osc_prompt_retry_base_seconds, 0.25)
+        self.assertEqual(config.osc_prompt_retry_max_seconds, 2.0)
+        for name in ("OSC_PROMPT_RETRY_BASE_SECONDS", "OSC_PROMPT_RETRY_MAX_SECONDS"):
+            for value in ("0", "-1", "nan", "inf", "not-a-number"):
+                with self.subTest(name=name, value=value), self.assertRaises(ConfigError):
+                    RuntimeConfig.from_environment({name: value})
+        with self.assertRaises(ConfigError) as context:
+            RuntimeConfig.from_environment({
+                "OSC_PROMPT_RETRY_BASE_SECONDS": "6",
+                "OSC_PROMPT_RETRY_MAX_SECONDS": "5",
+            })
+        self.assertIn(
+            "OSC_PROMPT_RETRY_BASE_SECONDS must not exceed OSC_PROMPT_RETRY_MAX_SECONDS",
+            context.exception.errors,
+        )
 
     def test_command_line_overrides_take_precedence(self):
         config = RuntimeConfig.from_environment(

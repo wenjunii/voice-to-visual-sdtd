@@ -123,7 +123,7 @@ class OscOutputPublisherTests(unittest.TestCase):
             None,
         ]
         logger = Mock()
-        clock = Mock(side_effect=[0.0, 1.0])
+        clock = Mock(return_value=0.0)
         publisher = OscOutputPublisher(
             "127.0.0.1",
             7000,
@@ -134,6 +134,7 @@ class OscOutputPublisherTests(unittest.TestCase):
         )
 
         self.assertFalse(publisher.send("/prompt", "private prompt"))
+        clock.return_value = 1.0
         self.assertFalse(publisher.send("/prompt", "private prompt"))
         self.assertTrue(publisher.send("/backend", "whisper"))
 

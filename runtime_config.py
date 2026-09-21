@@ -222,6 +222,12 @@ class RuntimeConfig:
     osc_output_error_log_interval: float = _config_field(
         "OSC_OUTPUT_ERROR_LOG_INTERVAL", 5.0
     )
+    osc_prompt_retry_base_seconds: float = _config_field(
+        "OSC_PROMPT_RETRY_BASE_SECONDS", 0.5
+    )
+    osc_prompt_retry_max_seconds: float = _config_field(
+        "OSC_PROMPT_RETRY_MAX_SECONDS", 5.0
+    )
 
     runtime_log_level: str = _config_field("RUNTIME_LOG_LEVEL", "info")
     runtime_log_console_enabled: bool = _config_field(
@@ -502,6 +508,8 @@ class RuntimeConfig:
                 "OSC_OUTPUT_ERROR_LOG_INTERVAL": (
                     self.osc_output_error_log_interval
                 ),
+                "OSC_PROMPT_RETRY_BASE_SECONDS": self.osc_prompt_retry_base_seconds,
+                "OSC_PROMPT_RETRY_MAX_SECONDS": self.osc_prompt_retry_max_seconds,
                 "RUNTIME_LOG_MAX_BYTES": self.runtime_log_max_bytes,
                 "RUNTIME_LOG_BACKUP_COUNT": self.runtime_log_backup_count,
                 "RUNTIME_SHUTDOWN_GRACE_SECONDS": (
@@ -608,6 +616,13 @@ class RuntimeConfig:
 
         self._validate_port(errors, "OSC_PORT", self.osc_port)
         self._validate_port(errors, "OSC_CONTROL_PORT", self.osc_control_port)
+        self._validate_order(
+            errors,
+            "OSC_PROMPT_RETRY_BASE_SECONDS",
+            self.osc_prompt_retry_base_seconds,
+            "OSC_PROMPT_RETRY_MAX_SECONDS",
+            self.osc_prompt_retry_max_seconds,
+        )
         self._validate_order(
             errors,
             "WHISPER_MIN_AUDIO_SECONDS",

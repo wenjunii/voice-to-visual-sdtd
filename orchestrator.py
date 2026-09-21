@@ -409,6 +409,8 @@ def main(argv=None):
                 config.osc_port,
                 status_interval=config.osc_status_interval,
                 error_log_interval=config.osc_output_error_log_interval,
+                prompt_retry_base_seconds=config.osc_prompt_retry_base_seconds,
+                prompt_retry_max_seconds=config.osc_prompt_retry_max_seconds,
                 logger=log_session.logger("osc"),
             )
         )
