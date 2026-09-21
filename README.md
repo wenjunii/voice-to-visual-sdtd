@@ -26,7 +26,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Backend Dependency Profiles**: Install only the shared bridge packages and the selected transcription backend instead of pulling every CUDA, cloud, translation, and visual runtime into one environment.
 - **Offline-Safe SDXL Prompt Budgeting**: Uses both exact SDXL CLIP tokenizers when cached, then automatically falls back to a conservative network-free upper bound so tokenizer download or cache failures cannot silently produce oversized prompts.
 - **Two-Way OSC Integration**: Sends prompts and runtime health to TouchDesigner on port 7000 and accepts live controls from TouchDesigner on port 7001.
-- **Resilient OSC Output**: Isolates UDP delivery failures from audio and transcription, rate-limits outage logs, reports recovery, and exposes an in-memory publisher for deterministic protocol and replay tests.
+- **Resilient OSC Output**: Isolates UDP send failures from audio and transcription, retries only the latest failed visual prompt with capped backoff, and exposes an in-memory publisher for deterministic protocol and replay tests.
 - **Validated Runtime Configuration**: Types and checks environment settings before startup, reports every configuration problem together, and safely shows effective values with credentials redacted.
 - **Instance-Scoped Runtime Settings**: Every pipeline uses its own immutable configuration for audio, VAD, scheduling, prompts, retries, and OSC, preventing settings from leaking between embedded or test instances.
 - **Structured Session Logging**: Labels operational events by subsystem, captures latency/retry/reconnection metrics, optionally rotates JSON Lines log files, and redacts configured credentials.
@@ -203,6 +203,9 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
     OSC_CONTROL_PORT=7001
     OSC_STATUS_INTERVAL=0.5
     OSC_OUTPUT_ERROR_LOG_INTERVAL=5.0
+    # Retry only the latest failed /prompt while the live status loop is running.
+    OSC_PROMPT_RETRY_BASE_SECONDS=0.5
+    OSC_PROMPT_RETRY_MAX_SECONDS=5.0
 
     # Human-readable operational console logs and optional rotating JSON Lines files.
     RUNTIME_LOG_LEVEL=info
@@ -403,7 +406,19 @@ RUNTIME_SHUTDOWN_GRACE_SECONDS=25.0
 
 The file rotates before exceeding the configured size and retains the configured number of backups. Each record contains a timestamp, session ID, subsystem, event name, level, message, and relevant metrics. Raw prompt and transcript text remains in the live console instead of the operational file, and configured API keys plus bearer credentials are replaced with `<redacted>`.
 
-OSC delivery failures produce a rate-limited `osc_output_error` event without including the prompt or transcript value. Audio capture and transcription continue while TouchDesigner or the network is unavailable, and the first successful send records `osc_output_recovered`. Set `OSC_OUTPUT_ERROR_LOG_INTERVAL` to control the minimum number of seconds between outage warnings.
+OSC send failures produce a rate-limited `osc_output_error` event without including the prompt or transcript value. Audio capture and transcription continue through local socket errors, and the first subsequent successful socket send records `osc_output_recovered`. Set `OSC_OUTPUT_ERROR_LOG_INTERVAL` to control the minimum number of seconds between outage warnings.
+
+### Latest-Prompt Recovery
+
+If sending `/prompt` fails, the output publisher retains one pending prompt. Newer speech or visual-control changes replace that value, so recovery never drains a backlog of obsolete prompts. The live runtime services retries through its existing status loop, even without new speech or when a status snapshot is throttled. Successful status sends do not discard the pending prompt.
+
+`OSC_PROMPT_RETRY_BASE_SECONDS` (default `0.5`) and `OSC_PROMPT_RETRY_MAX_SECONDS` (default `5.0`) control exponential backoff: by default, failed attempts wait `0.5`, `1`, `2`, `4`, then at most `5` seconds between retries. Both values must be finite and positive, and the base must not exceed the maximum. New prompts replace the pending value without resetting the current delay; forced status requests cannot bypass it. A successful prompt send clears the slot and resets the delay. There is no extra retry thread or blocking sleep, and retries continue only while the runtime services status updates.
+
+`/scene_reset` clears pending prompt output before attempting to send the reset, even if that send fails. Closing the publisher also clears pending output: shutdown and WAV replay completion do not wait for network recovery. The one-shot `orchestrator.py` command has no status loop and does not wait to retry a failed send before closing.
+
+Only `/prompt` is retried. Transcript events, control acknowledgements, scene-context text, and other metadata retain their existing best-effort behavior; retries do not duplicate `/transcript_final` events. `osc_prompt_recovered` records that the latest pending prompt was successfully sent, separately from general socket recovery and without prompt text. The existing `prompt_emitted` and `prompt_refreshed` log events include `osc_sent` to distinguish an immediate successful send from a deferred or failed attempt.
+
+OSC uses UDP: a successful socket send is not an acknowledgement from TouchDesigner. This mechanism handles reported local send errors, not silent packet loss or an absent receiver; those require a receiver acknowledgement or explicit resynchronization protocol.
 
 ### Graceful Shutdown
 
@@ -484,7 +499,7 @@ Accepted profile changes return `/control_ack`; scene resets emit `/scene_reset`
 - `audio_runtime.py` owns CPU voice activity detectors.
 - `runtime_scheduler.py` owns configurable freshness/FIFO overflow handling, bounded final/partial scheduling, retry protection, queued-final expiry notifications, and queue metrics.
 - `backend_errors.py` owns retry timing and `Retry-After` parsing.
-- `osc_output.py` owns the immutable runtime-status protocol, thread-safe UDP delivery, outage/recovery logging, and in-memory test publisher.
+- `osc_output.py` owns the immutable runtime-status protocol, thread-safe UDP delivery, latest-prompt retry backoff and invalidation, outage/recovery logging, and in-memory test publisher.
 - `osc_control.py` owns the TouchDesigner control server and control aliases.
 - `diagnostics.py` owns the read-only startup health checks.
 - `transcript_filter.py` conservatively removes known standalone Whisper hallucinations.
@@ -513,6 +528,8 @@ Scene-reset regression tests cover queued and buffered speech, transcription com
 Result-age tests use a simulated clock to cover slow partial and final results, exact-limit acceptance, disabled limits, queue and retry time, discard telemetry, scene-reset precedence, and recovery with fresh speech.
 
 Queue-expiry cleanup tests cover repeated expiry after accepted partials, retry cooldowns, replay completion, preservation of unrelated and active partial state, and partial results or failures arriving after their final was discarded. Scheduler tests verify exactly-once notifications on every purge path, callbacks outside the scheduler lock, and unchanged boundary, disabled-limit, and reset behavior.
+
+OSC prompt-retry tests use a simulated transport and clock to cover recovery without new speech, newest-prompt replacement, visual-control refreshes, capped backoff, forced and throttled status calls, concurrent resets, shutdown cancellation, configuration validation, and non-replay of transcript events. They create no network sockets.
 
 Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 

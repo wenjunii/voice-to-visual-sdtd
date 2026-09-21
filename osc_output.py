@@ -1,3 +1,4 @@
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -75,16 +76,27 @@ class OscOutputPublisher:
         *,
         status_interval=0.5,
         error_log_interval=5.0,
+        prompt_retry_base_seconds=0.5,
+        prompt_retry_max_seconds=5.0,
         logger=None,
         client_factory=None,
         clock=None,
     ):
         if status_interval <= 0 or error_log_interval <= 0:
             raise ValueError("OSC output intervals must be positive")
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in (prompt_retry_base_seconds, prompt_retry_max_seconds)
+        ):
+            raise ValueError("OSC prompt retry intervals must be finite and positive")
+        if prompt_retry_base_seconds > prompt_retry_max_seconds:
+            raise ValueError("OSC prompt retry base must not exceed its maximum")
         self.ip = ip
         self.port = port
         self.status_interval = status_interval
         self.error_log_interval = error_log_interval
+        self.prompt_retry_base_seconds = prompt_retry_base_seconds
+        self.prompt_retry_max_seconds = prompt_retry_max_seconds
         self.logger = logger
         self.clock = clock or time.monotonic
         factory = client_factory or udp_client.SimpleUDPClient
@@ -95,9 +107,20 @@ class OscOutputPublisher:
         self._delivery_degraded = False
         self._failure_count = 0
         self._closed = False
+        self._clear_pending_prompt_unlocked()
 
     def send(self, address, value):
         with self._lock:
+            if self._closed:
+                return False
+            if address == "/scene_reset":
+                # Invalidate even if sending the reset itself fails.
+                self._clear_pending_prompt_unlocked()
+            if address == "/prompt":
+                # One latest-value slot, not a queue. New speech/controls must
+                # neither replay an older prompt nor bypass outage backoff.
+                self._pending_prompt = OscMessage(address, value)
+                return self._retry_pending_prompt_unlocked(self.clock())
             return self._send_unlocked(address, value)
 
     def publish_status(self, snapshot, *, force=False):
@@ -105,6 +128,9 @@ class OscOutputPublisher:
             if self._closed:
                 return False
             now = self.clock()
+            # A forced status does not bypass prompt backoff; a throttled status
+            # still services due prompts. No extra worker or blocking wait.
+            self._retry_pending_prompt_unlocked(now)
             if (
                 not force
                 and self._last_status_time is not None
@@ -125,6 +151,7 @@ class OscOutputPublisher:
             if self._closed:
                 return
             self._closed = True
+            self._clear_pending_prompt_unlocked()
             close = getattr(self.client, "close", None)
             if close is None:
                 close = getattr(getattr(self.client, "_sock", None), "close", None)
@@ -133,6 +160,37 @@ class OscOutputPublisher:
                     close()
                 except Exception:
                     pass
+
+    def _clear_pending_prompt_unlocked(self):
+        self._pending_prompt = None
+        self._prompt_retry_at = 0.0
+        self._prompt_retry_delay = self.prompt_retry_base_seconds
+        self._prompt_failures = 0
+
+    def _retry_pending_prompt_unlocked(self, now):
+        if self._pending_prompt is None or now < self._prompt_retry_at:
+            return False
+        message = self._pending_prompt
+        if self._send_unlocked(message.address, message.value):
+            failures = self._prompt_failures
+            self._clear_pending_prompt_unlocked()
+            if failures and self.logger is not None:
+                self.logger.info(
+                    "Latest pending OSC prompt sent successfully",
+                    extra={
+                        "event": "osc_prompt_recovered",
+                        "ip": self.ip,
+                        "port": self.port,
+                        "failures": failures,
+                    },
+                )
+            return True
+        self._prompt_failures += 1
+        self._prompt_retry_at = now + self._prompt_retry_delay
+        self._prompt_retry_delay = min(
+            self.prompt_retry_max_seconds, self._prompt_retry_delay * 2
+        )
+        return False
 
     def _send_unlocked(self, address, value):
         if self._closed:

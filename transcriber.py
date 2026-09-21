@@ -362,6 +362,8 @@ class RealTimePipeline:
                     error_log_interval=(
                         self.config.osc_output_error_log_interval
                     ),
+                    prompt_retry_base_seconds=self.config.osc_prompt_retry_base_seconds,
+                    prompt_retry_max_seconds=self.config.osc_prompt_retry_max_seconds,
                     logger=self.osc_logger,
                 )
                 if enable_osc
@@ -1308,7 +1310,7 @@ class RealTimePipeline:
             return
         final_prompt = self.build_visual_prompt(text)
 
-        self.send_osc_message("/prompt", final_prompt)
+        prompt_sent = self.send_osc_message("/prompt", final_prompt)
         self.send_osc_message("/partial_text", raw_text)
         self.send_osc_message("/scene_context", text)
         self.send_osc_message("/prompt_tokens", self.last_prompt_token_count)
@@ -1318,9 +1320,10 @@ class RealTimePipeline:
 
         state = "FINAL" if is_final else "STABLE"
         self.prompt_logger.info(
-            "Visual prompt emitted",
+            "Visual prompt submitted to OSC output",
             extra={
                 "event": "prompt_emitted",
+                "osc_sent": bool(prompt_sent),
                 "state": state.lower(),
                 "scene_character_count": len(text),
                 "transcript_character_count": len(raw_text),
@@ -1344,13 +1347,14 @@ class RealTimePipeline:
             return False
 
         final_prompt = self.build_visual_prompt(text)
-        self.send_osc_message("/prompt", final_prompt)
+        prompt_sent = self.send_osc_message("/prompt", final_prompt)
         self.send_osc_message("/prompt_tokens", self.last_prompt_token_count)
         self.send_osc_message("/prompt_budget_mode", self.prompt_budget_mode)
         self.prompt_logger.info(
             "Visual prompt refreshed after control change",
             extra={
                 "event": "prompt_refreshed",
+                "osc_sent": bool(prompt_sent),
                 "prompt_tokens": self.last_prompt_token_count,
                 "prompt_budget_mode": self.prompt_budget_mode,
                 "prompt_variant": self.last_prompt_variant,
