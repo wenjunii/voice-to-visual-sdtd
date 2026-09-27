@@ -21,7 +21,7 @@ A real-time bridge between spoken language and high-speed generative visuals. Th
 - **Bounded Audio Segments**: Long speech is split into configurable segments with overlap so words at a boundary are less likely to disappear.
 - **Freshness-First Backpressure**: Final speech is prioritized in a bounded queue, obsolete partial snapshots are replaced, and the default overflow policy evicts the oldest pending final so visuals follow the newest spoken intent.
 - **Transcription Age Limits and Cleanup**: Discards results that become too old during queueing or transcription and releases expired queued segments' transcript state for long-running sessions.
-- **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries and respect Groq's `Retry-After` response header.
+- **Retry-Aware Online Transcription**: Transient Groq and Google failures preserve final segments for bounded retries, respect valid Groq `Retry-After` hints, and fall back safely when retry delays are malformed or non-finite.
 - **Isolated Backend Adapters**: Local Whisper, faster-whisper, Groq, hybrid translation, and Google each own their model or API contract, timing limits, and resource cleanup behind one runtime interface.
 - **Backend Dependency Profiles**: Install only the shared bridge packages and the selected transcription backend instead of pulling every CUDA, cloud, translation, and visual runtime into one environment.
 - **Offline-Safe SDXL Prompt Budgeting**: Uses both exact SDXL CLIP tokenizers when cached, then automatically falls back to a conservative network-free upper bound so tokenizer download or cache failures cannot silently produce oversized prompts.
@@ -369,6 +369,14 @@ Replay accepts mono or multichannel PCM input at any valid sample rate. It conve
 
 `--replay` cannot be combined with `--benchmark` or `--input-device`. Benchmark mode calls the selected local model repeatedly to measure performance; replay mode processes the recording once through the complete streaming system.
 
+### Online Retry Timing
+
+Retryable network and service failures use exponential backoff controlled by `TRANSCRIPTION_RETRY_BASE_SECONDS` and `TRANSCRIPTION_RETRY_MAX_SECONDS` when no usable server hint is available. Final segments may retry up to `TRANSCRIPTION_FINAL_MAX_RETRIES`; partial failures still apply the endpoint cooldown but are not requeued.
+
+Groq's `Retry-After` header accepts finite, non-negative numeric seconds (including zero and fractional seconds) or an HTTP date. A past date means zero delay. Missing, malformed, negative numeric, or non-finite values such as `NaN`, `Infinity`, and `1e309` use the configured fallback backoff instead of disabling future transcription or bypassing the intended delay. Direct hints supplied by backend adapters are validated again before updating the shared cooldown or scheduling a retry.
+
+The fallback maximum does not shorten a valid server-provided delay, and an existing longer endpoint cooldown is preserved. Queue expiry and scene resets still discard obsolete speech without cancelling that endpoint cooldown. The `/retry_in` status and retry logs report the effective remaining cooldown and scheduled retry delay respectively; invalid hints cannot introduce an infinite deadline.
+
 ### Freshness-First Queue Backpressure
 
 `TRANSCRIPTION_MAX_FINAL_JOBS` bounds finalized speech waiting for transcription. When that queue fills, the default `TRANSCRIPTION_FINAL_OVERFLOW_POLICY=drop_oldest` discards the oldest pending final and admits the newest speech, keeping a live visual performance aligned with the speaker's current intent. Set the policy to `drop_newest` when preserving the already queued FIFO history matters more than freshness.
@@ -498,7 +506,7 @@ Accepted profile changes return `/control_ack`; scene resets emit `/scene_reset`
 - `runtime_logging.py` owns session IDs, subsystem context, credential redaction, human console formatting, and rotating JSON Lines files.
 - `audio_runtime.py` owns CPU voice activity detectors.
 - `runtime_scheduler.py` owns configurable freshness/FIFO overflow handling, bounded final/partial scheduling, retry protection, queued-final expiry notifications, and queue metrics.
-- `backend_errors.py` owns retry timing and `Retry-After` parsing.
+- `backend_errors.py` owns retry timing, finite/non-negative delay validation, and `Retry-After` parsing.
 - `osc_output.py` owns the immutable runtime-status protocol, thread-safe UDP delivery, latest-prompt retry backoff and invalidation, outage/recovery logging, and in-memory test publisher.
 - `osc_control.py` owns the TouchDesigner control server and control aliases.
 - `diagnostics.py` owns the read-only startup health checks.
@@ -530,6 +538,8 @@ Result-age tests use a simulated clock to cover slow partial and final results, 
 Queue-expiry cleanup tests cover repeated expiry after accepted partials, retry cooldowns, replay completion, preservation of unrelated and active partial state, and partial results or failures arriving after their final was discarded. Scheduler tests verify exactly-once notifications on every purge path, callbacks outside the scheduler lock, and unchanged boundary, disabled-limit, and reset behavior.
 
 OSC prompt-retry tests use a simulated transport and clock to cover recovery without new speech, newest-prompt replacement, visual-control refreshes, capped backoff, forced and throttled status calls, concurrent resets, shutdown cancellation, configuration validation, and non-replay of transcript events. They create no network sockets.
+
+Online retry-timing tests cover invalid and overflowing numeric hints, HTTP dates, adapter-supplied hints, capped fallback delays, preserved server cooldowns, and recovery through the Groq adapter and transcription loop after simulated `429` and `503` responses. Additional cases cover expired queues, scene resets, exhausted final retries, and partial failures without making network requests.
 
 Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 
