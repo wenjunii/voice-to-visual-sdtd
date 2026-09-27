@@ -17,7 +17,11 @@ from audio_sources import (
     list_system_audio_input_devices,
     load_wav_samples,
 )
-from backend_errors import RetryableTranscriptionError, exponential_backoff
+from backend_errors import (
+    RetryableTranscriptionError,
+    exponential_backoff,
+    normalize_retry_delay,
+)
 from diagnostics import run_diagnostics
 from osc_control import OscControlServer
 from osc_output import (
@@ -1146,7 +1150,9 @@ class RealTimePipeline:
 
     def _handle_retryable_failure_locked(self, job, exc, scene_generation):
         now = time.monotonic()
-        retry_delay = exc.retry_after
+        # Adapters can supply hints directly, bypassing HTTP header parsing.
+        # Never let malformed or non-finite hints poison the shared cooldown.
+        retry_delay = normalize_retry_delay(exc.retry_after)
         if retry_delay is None:
             retry_delay = exponential_backoff(
                 job.attempts,
