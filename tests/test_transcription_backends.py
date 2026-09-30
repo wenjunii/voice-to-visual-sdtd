@@ -395,6 +395,29 @@ class GoogleBackendTests(unittest.TestCase):
             "es-ES",
         )
 
+    def test_configures_timeout_on_the_injected_recognizer(self):
+        recognizer = Mock()
+        recognizer.operation_timeout = None
+        recognizer.recognize_google.return_value = "hello"
+        backend = GoogleBackend(
+            config_for("google", google_request_timeout=3.5), recognizer,
+            self.speech_module(), sample_rate=16000,
+        )
+        backend.transcribe(np.array([0], dtype=np.int16))
+        self.assertEqual(recognizer.operation_timeout, 3.5)
+
+    def test_socket_timeouts_are_retryable(self):
+        recognizer = Mock()
+        timeout = TimeoutError("socket stalled")
+        recognizer.recognize_google.side_effect = timeout
+        backend = GoogleBackend(
+            config_for("google"), recognizer, self.speech_module(), sample_rate=16000,
+        )
+        with self.assertRaisesRegex(RetryableTranscriptionError, "timed out") as context:
+            backend.transcribe(np.array([0], dtype=np.int16))
+        self.assertIs(context.exception.__cause__, timeout)
+        self.assertIsNone(context.exception.retry_after)
+
     def test_unknown_speech_returns_an_empty_transcript(self):
         recognizer = Mock()
         speech_module = self.speech_module()

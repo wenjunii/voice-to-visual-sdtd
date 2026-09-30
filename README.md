@@ -280,6 +280,7 @@ Set a persistent startup profile with `DEFAULT_GENDER`, `DEFAULT_AGE`, `DEFAULT_
 
     # Recognition-only online experiment. This does not translate to English.
     # TRANSCRIPTION_BACKEND=google
+    # GOOGLE_REQUEST_TIMEOUT=20.0
     # GOOGLE_SPEECH_LANGUAGE=en-US
     # GOOGLE_SPEECH_CHINESE_LANGUAGE=zh-CN
     # GOOGLE_SPEECH_SPANISH_LANGUAGE=es-ES
@@ -376,6 +377,8 @@ Retryable network and service failures use exponential backoff controlled by `TR
 Groq's `Retry-After` header accepts finite, non-negative numeric seconds (including zero and fractional seconds) or an HTTP date. A past date means zero delay. Missing, malformed, negative numeric, or non-finite values such as `NaN`, `Infinity`, and `1e309` use the configured fallback backoff instead of disabling future transcription or bypassing the intended delay. Direct hints supplied by backend adapters are validated again before updating the shared cooldown or scheduling a retry.
 
 The fallback maximum does not shorten a valid server-provided delay, and an existing longer endpoint cooldown is preserved. Queue expiry and scene resets still discard obsolete speech without cancelling that endpoint cooldown. The `/retry_in` status and retry logs report the effective remaining cooldown and scheduled retry delay respectively; invalid hints cannot introduce an infinite deadline.
+
+The Google backend sets `GOOGLE_REQUEST_TIMEOUT` (default `20.0` seconds) on SpeechRecognition's [network operation timeout](https://github.com/Uberi/speech_recognition/blob/master/reference/library-reference.rst). The setting must be finite and greater than zero. A socket timeout enters the same capped backoff and final-segment retry flow as other transient request errors. Graceful shutdown waits for in-flight recognition to finish or raise an error. This setting limits blocking network operations; it is not a deadline for the entire recognition call.
 
 ### Freshness-First Queue Backpressure
 
@@ -539,7 +542,7 @@ Queue-expiry cleanup tests cover repeated expiry after accepted partials, retry 
 
 OSC prompt-retry tests use a simulated transport and clock to cover recovery without new speech, newest-prompt replacement, visual-control refreshes, capped backoff, forced and throttled status calls, concurrent resets, shutdown cancellation, configuration validation, and non-replay of transcript events. They create no network sockets.
 
-Online retry-timing tests cover invalid and overflowing numeric hints, HTTP dates, adapter-supplied hints, capped fallback delays, preserved server cooldowns, and recovery through the Groq adapter and transcription loop after simulated `429` and `503` responses. Additional cases cover expired queues, scene resets, exhausted final retries, and partial failures without making network requests.
+Online retry-timing tests cover invalid and overflowing numeric hints, HTTP dates, adapter-supplied hints, capped fallback delays, preserved server cooldowns, and recovery through the Groq adapter and transcription loop after simulated `429` and `503` responses. Google tests validate timeout configuration, socket-timeout classification, and final-transcript recovery through the transcription loop after a simulated stalled request. Additional cases cover expired queues, scene resets, exhausted final retries, and partial failures without making network requests.
 
 Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 

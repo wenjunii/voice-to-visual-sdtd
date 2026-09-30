@@ -331,6 +331,7 @@ class RuntimeConfig:
     google_max_audio_seconds: float = _config_field(
         "GOOGLE_MAX_AUDIO_SECONDS", 5.0
     )
+    google_request_timeout: float = _config_field("GOOGLE_REQUEST_TIMEOUT", 20.0)
     google_speech_language: str = _config_field(
         "GOOGLE_SPEECH_LANGUAGE", "en-US"
     )
@@ -525,6 +526,7 @@ class RuntimeConfig:
                 "GOOGLE_TRANSCRIPTION_INTERVAL": self.google_transcription_interval,
                 "GOOGLE_MIN_AUDIO_SECONDS": self.google_min_audio_seconds,
                 "GOOGLE_MAX_AUDIO_SECONDS": self.google_max_audio_seconds,
+                "GOOGLE_REQUEST_TIMEOUT": self.google_request_timeout,
                 "VAD_ENERGY_THRESHOLD": self.vad_energy_threshold,
                 "VAD_SILENCE_SECONDS": self.vad_silence_seconds,
                 "TRANSCRIPT_CONFIRM_UPDATES": self.transcript_confirm_updates,
