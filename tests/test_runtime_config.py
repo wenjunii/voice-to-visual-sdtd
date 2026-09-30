@@ -21,6 +21,7 @@ class RuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(config.transcription_backend, "whisper")
         self.assertEqual(config.osc_port, 7000)
+        self.assertEqual(config.google_request_timeout, 20.0)
         self.assertTrue(config.osc_control_enabled)
         self.assertEqual(config.osc_output_error_log_interval, 5.0)
         self.assertEqual(config.osc_prompt_retry_base_seconds, 0.5)
@@ -69,6 +70,13 @@ class RuntimeConfigTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(environment_names), len(set(environment_names)))
+
+    def test_google_request_timeout_is_finite_and_positive(self):
+        config = RuntimeConfig.from_environment({"GOOGLE_REQUEST_TIMEOUT": "3.5"})
+        self.assertEqual(config.google_request_timeout, 3.5)
+        for value in ("0", "-1", "nan", "inf", "invalid"):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                RuntimeConfig.from_environment({"GOOGLE_REQUEST_TIMEOUT": value})
 
     def test_loads_and_validates_prompt_retry_intervals(self):
         config = RuntimeConfig.from_environment({

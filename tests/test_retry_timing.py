@@ -11,9 +11,10 @@ from backend_errors import RetryableTranscriptionError
 from osc_output import RecordingOutputPublisher
 from runtime_config import RuntimeConfig
 from streaming_core import AudioSegment
+from tests import test_transcription_backends as backend_tests
 from tests.test_transcriber_controls import make_pipeline
 from tests.test_transcription_backends import response
-from transcription_backends import GroqTranslationBackend
+from transcription_backends import GoogleBackend, GroqTranslationBackend
 
 
 def segment(segment_id=1, *, is_final=True):
@@ -139,6 +140,62 @@ class RetryTimingTests(unittest.TestCase):
                         [m.value for m in publisher.messages if m.address == "/transcript_final"],
                         ["a fresh lake"],
                     )
+
+    def test_google_socket_timeout_recovers_through_the_real_transcription_loop(self):
+        config = replace(
+            RuntimeConfig(), transcription_backend="google",
+            google_request_timeout=3.0, google_transcription_interval=0.1,
+            transcription_retry_base_seconds=1.0,
+            transcription_retry_max_seconds=4.0,
+        )
+        clock = Mock(return_value=100.0)
+        recognizer = Mock()
+        recognizer.operation_timeout = None
+        attempts = []
+
+        def recognize(*args, **kwargs):
+            attempts.append((clock.return_value, recognizer.operation_timeout))
+            if len(attempts) == 1:
+                clock.return_value += recognizer.operation_timeout
+                raise TimeoutError("simulated stalled request")
+            return "a fresh lake"
+
+        def advance(_timeout):
+            clock.return_value += 0.25
+            if clock.return_value > 106.0:
+                raise AssertionError("Google backend did not recover from its timeout")
+            return False
+
+        recognizer.recognize_google.side_effect = recognize
+        backend = GoogleBackend(
+            config, recognizer, backend_tests.GoogleBackendTests.speech_module(),
+            sample_rate=16000,
+        )
+        publisher = RecordingOutputPublisher()
+        pipeline = make_pipeline(config, backend_adapter=backend, output_publisher=publisher)
+        self.addCleanup(pipeline.close)
+        pipeline.scheduler.submit_final(segment(), now=100.0)
+        pipeline.audio_source_finished.set()
+        with (
+            patch("transcriber.time.monotonic", clock),
+            patch.object(pipeline.stop_event, "wait", side_effect=advance),
+            redirect_stdout(StringIO()),
+        ):
+            pipeline.transcription_loop()
+
+        self.assertEqual(attempts, [(100.0, 3.0), (104.0, 3.0)])
+        self.assertEqual(pipeline.last_text, "a fresh lake")
+        self.assertEqual(pipeline.scheduler.metrics().retries, 1)
+        self.assertEqual(pipeline.scheduler.metrics().processed, 1)
+        self.assertEqual(pipeline.scheduler.metrics().failed, 0)
+        self.assertEqual(pipeline.scheduler.metrics().dropped_stale, 0)
+        self.assertEqual(
+            [m.value for m in publisher.messages if m.address == "/transcript_final"],
+            ["a fresh lake"],
+        )
+        retry_event = pipeline.transcription_logger.warning.call_args.kwargs["extra"]
+        self.assertEqual(retry_event["event"], "transcription_retry_scheduled")
+        self.assertEqual(retry_event["retry_in_seconds"], 1.0)
 
     def test_expired_queue_and_scene_reset_do_not_leave_permanent_cooldown(self):
         pipeline, _ = self.make_pipeline()

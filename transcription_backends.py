@@ -612,6 +612,7 @@ class GoogleBackend(TranscriptionBackend):
         )
         self.config = config
         self.recognizer = recognizer
+        self.recognizer.operation_timeout = config.google_request_timeout
         self.speech_recognition = speech_recognition
         self.sample_rate = sample_rate
 
@@ -633,6 +634,10 @@ class GoogleBackend(TranscriptionBackend):
             ).strip()
         except self.speech_recognition.UnknownValueError:
             return ""
+        except TimeoutError as exc:
+            raise RetryableTranscriptionError(
+                "Google transcription request timed out"
+            ) from exc
         except self.speech_recognition.RequestError as exc:
             raise RetryableTranscriptionError(
                 f"Google transcription request failed: {exc}"
