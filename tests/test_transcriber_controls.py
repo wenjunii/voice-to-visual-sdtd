@@ -161,7 +161,7 @@ class CommandLineTests(unittest.TestCase):
 
     def test_replay_builds_a_finite_source_for_the_live_pipeline(self):
         source = Mock()
-        pipeline = Mock()
+        pipeline = Mock(exit_code=0)
         with (
             patch("transcriber.load_runtime_config", return_value=RuntimeConfig()),
             patch("transcriber.WavReplaySource", return_value=source) as source_type,
