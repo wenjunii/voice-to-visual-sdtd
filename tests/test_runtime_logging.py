@@ -202,6 +202,7 @@ class PipelineLoggingIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(records[0]["backend"], "whisper")
         self.assertEqual(records[1]["processed_jobs"], 0)
+        self.assertEqual(records[1]["exit_code"], 0)
         adapter.close.assert_called_once_with()
 
 

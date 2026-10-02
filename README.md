@@ -437,6 +437,10 @@ Ctrl+C and terminal audio failures signal the audio and transcription workers th
 
 `RUNTIME_SHUTDOWN_GRACE_SECONDS` is an observability threshold rather than a destructive timeout. If a worker is still active after the grace period, the runtime records a `worker_shutdown_overdue` warning with the worker name and continues waiting. This preserves cleanup ordering and avoids closing an HTTP session, model, or log handler while a worker is still using it.
 
+The live/replay command returns exit code `0` for normal Ctrl+C or completed replay and `1` for a terminal audio failure or an unexpected worker crash. Argument and configuration validation errors return `2`. Launchers can inspect PowerShell's `$LASTEXITCODE` after the command finishes. A recovered microphone error, a failed transcription segment, or exhausted segment retries leaves the session running and does not mark the whole session as failed.
+
+Terminal failure status persists through cleanup, including a worker crash after shutdown was already requested. The `session_stop` log includes `exit_code`, and embedded callers can read `pipeline.exit_code` after `close()` has joined the workers.
+
 ### Resetting a Scene
 
 Send `/control/reset_scene` with any value to begin a fresh scene. Reset clears rolling scene memory, transcript stabilization, buffered speech and pre-roll, queued final segments, pending retries, and the pending partial snapshot. Audio reads already in progress at reset are discarded when they return; subsequent reads can begin new speech. WAV replay continues from its current position.
@@ -543,6 +547,8 @@ Queue-expiry cleanup tests cover repeated expiry after accepted partials, retry 
 OSC prompt-retry tests use a simulated transport and clock to cover recovery without new speech, newest-prompt replacement, visual-control refreshes, capped backoff, forced and throttled status calls, concurrent resets, shutdown cancellation, configuration validation, and non-replay of transcript events. They create no network sockets.
 
 Online retry-timing tests cover invalid and overflowing numeric hints, HTTP dates, adapter-supplied hints, capped fallback delays, preserved server cooldowns, and recovery through the Groq adapter and transcription loop after simulated `429` and `503` responses. Google tests validate timeout configuration, socket-timeout classification, and final-transcript recovery through the transcription loop after a simulated stalled request. Additional cases cover expired queues, scene resets, exhausted final retries, and partial failures without making network requests.
+
+Runtime exit-code tests run the command entry point with real worker threads and simulated audio/backends. They cover audio open/read failures, both worker crash paths, failures during shutdown, normal Ctrl+C, completed replay, recovered microphone outages, and isolated transcription failures while verifying ordered cleanup and the final session log.
 
 Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 

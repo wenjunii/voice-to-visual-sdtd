@@ -332,6 +332,7 @@ class RealTimePipeline:
                 self.log_session.close()
             raise
         self._backend_closed = False
+        self._failure_event = threading.Event()
         self.stop_event = threading.Event()
         self._worker_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -471,7 +472,15 @@ class RealTimePipeline:
     def is_running(self):
         return not self.stop_event.is_set()
 
-    def request_shutdown(self, reason=None):
+    @property
+    def exit_code(self):
+        """Report terminal runtime failures after workers have finished."""
+        return 1 if self._failure_event.is_set() else 0
+
+    def request_shutdown(self, reason=None, *, failed=False):
+        # Failure is sticky, including when a worker fails during normal shutdown.
+        if failed:
+            self._failure_event.set()
         was_requested = self.stop_event.is_set()
         self.stop_event.set()
         if not was_requested and reason:
@@ -480,6 +489,7 @@ class RealTimePipeline:
                 extra={
                     "event": "shutdown_requested",
                     "reason": reason,
+                    "exit_code": self.exit_code,
                 },
             )
         return not was_requested
@@ -530,7 +540,7 @@ class RealTimePipeline:
                     "error": self.clean_audio_error(exc),
                 },
             )
-            self.request_shutdown()
+            self.request_shutdown(f"worker_crashed:{worker_name}", failed=True)
         finally:
             self.runtime_logger.debug(
                 "Runtime worker stopped",
@@ -921,7 +931,7 @@ class RealTimePipeline:
                 or not self.config.audio_reconnect_enabled
             ):
                 self.audio_status = "error"
-                self.request_shutdown()
+                self.request_shutdown("audio_terminal_error", failed=True)
                 self.audio_logger.error(
                     "Audio source failed and cannot reconnect",
                     extra={
@@ -1743,6 +1753,7 @@ class RealTimePipeline:
                     "Runtime session stopped",
                     extra={
                         "event": "session_stop",
+                        "exit_code": self.exit_code,
                         "backend": self.backend,
                         "audio_source": self.audio_source.kind,
                         "audio_reconnects": self.audio_reconnects,
@@ -1817,7 +1828,7 @@ def main(argv=None):
             pipeline.start()
     finally:
         pipeline.close()
-    return 0
+    return pipeline.exit_code
 
 
 if __name__ == "__main__":
