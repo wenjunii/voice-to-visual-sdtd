@@ -94,16 +94,32 @@ class OscControlServer:
         self.thread = None
 
     def start(self):
+        if self.server is not None:
+            raise RuntimeError("The OSC control server is already started")
         dispatcher = Dispatcher()
         for address, control_name in CONTROL_ADDRESSES.items():
             dispatcher.map(address, partial(self._handle, control_name))
-        self.server = ThreadingOSCUDPServer((self.ip, self.port), dispatcher)
-        self.thread = threading.Thread(
-            name="voice-to-visual-osc-control",
-            target=self.server.serve_forever,
-        )
-        self.thread.start()
-        return self.server.server_address
+        server = ThreadingOSCUDPServer((self.ip, self.port), dispatcher)
+        thread = None
+        try:
+            thread = threading.Thread(
+                name="voice-to-visual-osc-control",
+                target=server.serve_forever,
+            )
+            thread.start()
+        except BaseException:
+            try:
+                # shutdown() requires a running loop. An interrupt may arrive
+                # after the native thread starts but before start() returns.
+                if thread is not None and thread.ident is not None:
+                    server.shutdown()
+                    thread.join()
+            finally:
+                server.server_close()
+            raise
+        self.server = server
+        self.thread = thread
+        return server.server_address
 
     def stop(self):
         if self.server is None:

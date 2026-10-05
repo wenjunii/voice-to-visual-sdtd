@@ -500,24 +500,41 @@ class RealTimePipeline:
                 raise RuntimeError("Runtime workers have already been started")
             if self._backend_closed:
                 raise RuntimeError("Runtime workers cannot start after close")
+            if not self.is_running:
+                raise RuntimeError("Runtime workers cannot start after shutdown")
 
             self._workers_started = True
-            workers = {
-                "audio": threading.Thread(
-                    name="voice-to-visual-audio",
-                    target=self._run_worker,
-                    args=("audio", self.audio_callback),
-                ),
-                "transcription": threading.Thread(
-                    name="voice-to-visual-transcription",
-                    target=self._run_worker,
-                    args=("transcription", self.transcription_loop),
-                ),
-            }
-            self._worker_threads = workers
-
-        for worker in workers.values():
-            worker.start()
+            try:
+                for worker_name, target in (
+                    ("audio", self.audio_callback),
+                    ("transcription", self.transcription_loop),
+                ):
+                    if not self.is_running:
+                        break
+                    worker = threading.Thread(
+                        name=f"voice-to-visual-{worker_name}",
+                        target=self._run_worker,
+                        args=(worker_name, target),
+                    )
+                    try:
+                        worker.start()
+                    finally:
+                        # An interrupt can arrive after the native thread starts.
+                        # Close waits for this lock and only joins started workers.
+                        if worker.ident is not None:
+                            self._worker_threads[worker_name] = worker
+            except Exception as exc:
+                self.request_shutdown("worker_start_error", failed=True)
+                self.runtime_logger.exception(
+                    "Runtime worker could not start",
+                    extra={
+                        "event": "worker_start_error",
+                        "worker": worker_name,
+                        "error": self.clean_audio_error(exc),
+                    },
+                )
+                raise
+            workers = dict(self._worker_threads)
 
         self.runtime_logger.info(
             "Runtime workers started",
@@ -1664,10 +1681,13 @@ class RealTimePipeline:
             self.send_runtime_status(force=True)
 
     def start(self):
-        self.start_osc_control_server()
-        self.start_worker_threads()
-        
+        if self._workers_started or self._backend_closed or not self.is_running:
+            raise RuntimeError("Runtime has already started or stopped")
+
         try:
+            self.start_osc_control_server()
+            self.start_worker_threads()
+
             print("\n" + "="*50)
             print(
                 f"BACKEND: {self.backend} | "
@@ -1720,6 +1740,9 @@ class RealTimePipeline:
                     break
         except KeyboardInterrupt:
             self.request_shutdown("keyboard_interrupt")
+        except Exception:
+            self.request_shutdown("runtime_error", failed=True)
+            raise
         finally:
             self.close()
 

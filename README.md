@@ -441,6 +441,10 @@ The live/replay command returns exit code `0` for normal Ctrl+C or completed rep
 
 Terminal failure status persists through cleanup, including a worker crash after shutdown was already requested. The `session_stop` log includes `exit_code`, and embedded callers can read `pipeline.exit_code` after `close()` has joined the workers.
 
+Startup uses the same cleanup path. If a worker cannot be created or started, the runtime cancels and joins any workers that already started, stops OSC controls, and closes the output publisher, backend, and owned log session before propagating the original error. The `worker_start_error` log identifies the worker that failed. Shutdown waits for worker startup registration to finish so it cannot close resources underneath a newly started worker. A stopped pipeline cannot be restarted.
+
+If the OSC control thread cannot start, its bound UDP socket is released. An interrupted OSC startup also stops any control thread that already started, allowing the port to be reused. Ctrl+C during pipeline startup follows normal cooperative shutdown.
+
 ### Resetting a Scene
 
 Send `/control/reset_scene` with any value to begin a fresh scene. Reset clears rolling scene memory, transcript stabilization, buffered speech and pre-roll, queued final segments, pending retries, and the pending partial snapshot. Audio reads already in progress at reset are discarded when they return; subsequent reads can begin new speech. WAV replay continues from its current position.
@@ -549,6 +553,8 @@ OSC prompt-retry tests use a simulated transport and clock to cover recovery wit
 Online retry-timing tests cover invalid and overflowing numeric hints, HTTP dates, adapter-supplied hints, capped fallback delays, preserved server cooldowns, and recovery through the Groq adapter and transcription loop after simulated `429` and `503` responses. Google tests validate timeout configuration, socket-timeout classification, and final-transcript recovery through the transcription loop after a simulated stalled request. Additional cases cover expired queues, scene resets, exhausted final retries, and partial failures without making network requests.
 
 Runtime exit-code tests run the command entry point with real worker threads and simulated audio/backends. They cover audio open/read failures, both worker crash paths, failures during shutdown, normal Ctrl+C, completed replay, recovered microphone outages, and isolated transcription failures while verifying ordered cleanup and the final session log.
+
+Startup regression tests cover failure to create or start either worker, direct and command-line startup, interruption before and after a thread starts, concurrent startup/shutdown, and cleanup order. OSC tests verify that a failed control-thread startup releases its loopback port for reuse and that duplicate starts preserve the existing listener.
 
 Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 
