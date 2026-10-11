@@ -3,7 +3,11 @@ import argparse
 import numpy as np
 import threading
 import time
-import msvcrt
+
+if os.name == "nt":
+    import msvcrt
+else:
+    msvcrt = None
 
 from audio_runtime import (
     EnergyVoiceActivityDetector,
@@ -51,6 +55,17 @@ from runtime_scheduler import RealtimeJobScheduler
 from streaming_core import AudioSegmenter, TranscriptStabilizer
 from transcript_filter import is_probable_whisper_hallucination
 from transcription_backends import create_transcription_backend
+
+
+def read_control_key():
+    """Poll Windows console shortcuts; headless hosts still use OSC or Ctrl+C."""
+    if msvcrt is None or not msvcrt.kbhit():
+        return None
+    try:
+        return msvcrt.getch().decode("utf-8").lower()
+    except UnicodeDecodeError:
+        return None
+
 
 def optional_non_negative_int(value):
     if value is None or str(value).strip() == "":
@@ -1724,15 +1739,14 @@ class RealTimePipeline:
                     f"{self.config.google_speech_language}"
                 )
             print("  Ctrl+C   -> Exit")
+            if msvcrt is None:
+                print("  Keyboard shortcuts require Windows; use OSC controls or Ctrl+C on this host.")
             print("="*50 + "\n")
             self.send_runtime_status(force=True)
             
             while self.is_running:
-                if msvcrt.kbhit():
-                    try:
-                        key = msvcrt.getch().decode("utf-8").lower()
-                    except UnicodeDecodeError:
-                        continue
+                key = read_control_key()
+                if key is not None:
                     control = KEYBOARD_CONTROLS.get(key)
                     if control is not None:
                         self.apply_control(*control)
