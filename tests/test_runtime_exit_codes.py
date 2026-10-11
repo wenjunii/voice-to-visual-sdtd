@@ -25,12 +25,12 @@ class RuntimeExitCodeTests(unittest.TestCase):
                 raise keyboard_error
             if time.perf_counter() >= deadline:
                 raise AssertionError("Pipeline did not finish shutting down")
-            return False
+            return None
 
         with (
             patch("transcriber.load_runtime_config", return_value=pipeline.config),
             patch("transcriber.RealTimePipeline", return_value=pipeline),
-            patch("transcriber.msvcrt.kbhit", side_effect=check_keyboard),
+            patch("transcriber.read_control_key", side_effect=check_keyboard),
             redirect_stdout(StringIO()),
         ):
             return main([])
