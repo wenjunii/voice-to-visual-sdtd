@@ -368,6 +368,8 @@ python transcriber.py --backend faster_whisper --replay .\sample.wav
 
 Replay accepts mono or multichannel PCM input at any valid sample rate. It converts the recording to the runtime's 16 kHz mono format, sends stable chunks through the same VAD and scheduler used by the microphone, drains the final transcription job, and then exits automatically. OSC output and controls remain enabled, so a recording can reproduce a complete TouchDesigner session without PyAudio or a live input device.
 
+Replay and benchmark recordings are validated before the transcription model initializes. Missing files, malformed headers, empty audio, truncated PCM data, and incomplete sample/channel frames produce a readable error and exit code `2`. If a recording is rejected, re-export the complete audio as an uncompressed 16-bit PCM WAV. Valid metadata chunks and their padding are ignored when decoding the audio.
+
 `--replay` cannot be combined with `--benchmark` or `--input-device`. Benchmark mode calls the selected local model repeatedly to measure performance; replay mode processes the recording once through the complete streaming system.
 
 ### Online Retry Timing
@@ -437,7 +439,7 @@ Ctrl+C and terminal audio failures signal the audio and transcription workers th
 
 `RUNTIME_SHUTDOWN_GRACE_SECONDS` is an observability threshold rather than a destructive timeout. If a worker is still active after the grace period, the runtime records a `worker_shutdown_overdue` warning with the worker name and continues waiting. This preserves cleanup ordering and avoids closing an HTTP session, model, or log handler while a worker is still using it.
 
-The live/replay command returns exit code `0` for normal Ctrl+C or completed replay and `1` for a terminal audio failure or an unexpected worker crash. Argument and configuration validation errors return `2`. Launchers can inspect PowerShell's `$LASTEXITCODE` after the command finishes. A recovered microphone error, a failed transcription segment, or exhausted segment retries leaves the session running and does not mark the whole session as failed.
+The live/replay command returns exit code `0` for normal Ctrl+C or completed replay and `1` for a terminal audio failure or an unexpected worker crash. Argument, configuration, and replay/benchmark WAV validation errors return `2`. Launchers can inspect PowerShell's `$LASTEXITCODE` after the command finishes. A recovered microphone error, a failed transcription segment, or exhausted segment retries leaves the session running and does not mark the whole session as failed.
 
 Terminal failure status persists through cleanup, including a worker crash after shutdown was already requested. The `session_stop` log includes `exit_code`, and embedded callers can read `pipeline.exit_code` after `close()` has joined the workers.
 
@@ -533,7 +535,7 @@ python transcriber.py --backend faster_whisper --benchmark .\sample.wav --benchm
 python transcriber.py --backend whisper --benchmark .\sample.wav --benchmark-runs 3
 ```
 
-The benchmark shares replay's validated PCM decoder, performs one warm-up pass, then reports latency and real-time factor for each measured run. A real-time factor below `1.0` means transcription is faster than the recording duration.
+The benchmark shares replay's validated PCM decoder and loads the recording once, before model initialization. It reuses those samples for one warm-up pass and all measured runs, then reports latency and real-time factor for each run. Invalid recordings exit with code `2` without loading a model. A real-time factor below `1.0` means transcription is faster than the recording duration.
 
 Run the streaming logic tests without loading a Whisper model:
 
@@ -556,7 +558,9 @@ Runtime exit-code tests run the command entry point with real worker threads and
 
 Startup regression tests cover failure to create or start either worker, direct and command-line startup, interruption before and after a thread starts, concurrent startup/shutdown, and cleanup order. OSC tests verify that a failed control-thread startup releases its loopback port for reuse and that duplicate starts preserve the existing listener.
 
-Pull requests and updates to `main` run the same unit suite on Windows with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
+WAV validation tests cover truncated headers and PCM payloads, incomplete multichannel frames, empty recordings, unsupported formats, malformed chunk boundaries, and valid metadata padding. Command-line tests verify early rejection without model initialization, single-load benchmark samples, unchanged warm-up/timing behavior, and cleanup after benchmark failures.
+
+Pull requests and updates to `main` run the same unit suite on Windows and Ubuntu with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 
 ## License
 

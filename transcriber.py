@@ -1542,14 +1542,16 @@ class RealTimePipeline:
     def maximum_audio_seconds(self):
         return self.backend_adapter.maximum_audio_seconds
 
-    def benchmark(self, wav_path, runs=3):
+    def benchmark(self, wav_path, runs=3, *, samples=None):
+        """Benchmark a WAV, or reuse its prevalidated 16 kHz mono PCM samples."""
         if self.backend not in {"whisper", "faster_whisper"}:
             raise RuntimeError("Benchmark mode supports only whisper and faster_whisper backends.")
 
-        samples = load_wav_samples(
-            wav_path,
-            target_sample_rate=RATE,
-        )
+        if samples is None:
+            samples = load_wav_samples(
+                wav_path,
+                target_sample_rate=RATE,
+            )
         audio_seconds = len(samples) / RATE
         runs = max(1, runs)
         warmup = samples[:min(len(samples), int(2 * RATE))]
@@ -1838,6 +1840,7 @@ def main(argv=None):
         )
 
     audio_source = None
+    benchmark_samples = None
     if args.replay:
         try:
             audio_source = WavReplaySource(
@@ -1848,6 +1851,15 @@ def main(argv=None):
             )
         except ValueError as exc:
             print(f"Invalid replay audio: {exc}")
+            return 2
+    elif args.benchmark:
+        try:
+            benchmark_samples = load_wav_samples(
+                args.benchmark,
+                target_sample_rate=RATE,
+            )
+        except ValueError as exc:
+            print(f"Invalid benchmark audio: {exc}")
             return 2
 
     pipeline = RealTimePipeline(
@@ -1860,7 +1872,11 @@ def main(argv=None):
     )
     try:
         if args.benchmark:
-            pipeline.benchmark(args.benchmark, args.benchmark_runs)
+            pipeline.benchmark(
+                args.benchmark,
+                args.benchmark_runs,
+                samples=benchmark_samples,
+            )
         else:
             pipeline.start()
     finally:

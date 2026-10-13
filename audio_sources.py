@@ -212,22 +212,41 @@ def load_wav_samples(wav_path, *, target_sample_rate=16000):
             source_rate = wav_file.getframerate()
             frame_count = wav_file.getnframes()
             compression = wav_file.getcomptype()
-            raw_audio = wav_file.readframes(frame_count)
+            if compression != "NONE":
+                raise ValueError("WAV audio requires uncompressed PCM audio.")
+            if sample_width != 2:
+                raise ValueError("WAV audio requires 16-bit PCM audio.")
+            if channels < 1:
+                raise ValueError("WAV audio requires at least one audio channel.")
+            if source_rate < 1:
+                raise ValueError("WAV audio has an invalid sample rate.")
+
+            # getnframes() rounds down a partial final frame. Read one extra
+            # frame to expose leftover bytes, without crossing the data chunk.
+            raw_audio = wav_file.readframes(frame_count + 1)
     except (OSError, wave.Error) as exc:
         raise ValueError(f"Could not read WAV file '{path}': {exc}") from exc
+    except (EOFError, RuntimeError) as exc:
+        # wave also raises EOFError for short headers and RuntimeError when
+        # a malformed chunk would seek outside its enclosing RIFF container.
+        raise ValueError(
+            f"Could not read WAV file '{path}': "
+            "malformed or incomplete WAV structure."
+        ) from exc
 
-    if compression != "NONE":
-        raise ValueError("WAV replay requires uncompressed PCM audio.")
-    if sample_width != 2:
-        raise ValueError("WAV replay requires 16-bit PCM audio.")
-    if channels < 1:
-        raise ValueError("WAV replay requires at least one audio channel.")
-    if source_rate < 1:
-        raise ValueError("WAV replay has an invalid sample rate.")
+    frame_bytes = channels * sample_width
+    if len(raw_audio) % frame_bytes:
+        raise ValueError("WAV audio ends with an incomplete PCM frame.")
+    expected_bytes = frame_count * frame_bytes
+    if len(raw_audio) != expected_bytes:
+        raise ValueError(
+            "WAV audio is truncated: "
+            f"expected {expected_bytes} PCM bytes, read {len(raw_audio)}."
+        )
+    if not raw_audio:
+        raise ValueError("WAV audio contains no audio samples.")
 
     samples = np.frombuffer(raw_audio, dtype="<i2")
-    if samples.size == 0:
-        raise ValueError("WAV replay contains no audio samples.")
     if channels > 1:
         samples = (
             samples.reshape(-1, channels)
