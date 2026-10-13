@@ -81,7 +81,7 @@ class WavValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "malformed or incomplete WAV") as error:
             load_wav_samples(self.path)
 
-        self.assertIn(str(self.path), str(error.exception))
+        self.assertIn(str(self.path.resolve()), str(error.exception))
 
     def test_empty_or_short_headers_have_actionable_errors(self):
         for recording in (b"", b"RIFF", pcm_wav(b"\x01\x00")[:30]):
@@ -91,7 +91,7 @@ class WavValidationTests(unittest.TestCase):
                     ValueError, "malformed or incomplete WAV"
                 ) as error:
                     load_wav_samples(self.path)
-                self.assertIn(str(self.path), str(error.exception))
+                self.assertIn(str(self.path.resolve()), str(error.exception))
 
     def test_rejects_empty_pcm_data(self):
         self.path.write_bytes(pcm_wav(b""))
@@ -132,7 +132,22 @@ class WavValidationTests(unittest.TestCase):
     def test_missing_recording_reports_its_path(self):
         with self.assertRaisesRegex(ValueError, "Could not read WAV file") as error:
             load_wav_samples(self.path)
-        self.assertIn(str(self.path), str(error.exception))
+        self.assertIn(str(self.path.resolve()), str(error.exception))
+
+    def test_read_errors_report_the_resolved_path_for_noncanonical_input(self):
+        nested_directory = self.path.parent / "nested"
+        nested_directory.mkdir()
+        input_path = nested_directory / ".." / self.path.name
+        # Diagnostics canonicalize paths, including Windows 8.3 temp aliases.
+        # A '..' component exercises a spelling difference on every platform.
+        expected_prefix = f"Could not read WAV file '{self.path.resolve()}':"
+        for recording in (None, b""):
+            with self.subTest(recording=recording):
+                if recording is not None:
+                    self.path.write_bytes(recording)
+                with self.assertRaises(ValueError) as error:
+                    load_wav_samples(input_path)
+                self.assertTrue(str(error.exception).startswith(expected_prefix))
 
 
 class WavCommandLineTests(unittest.TestCase):
