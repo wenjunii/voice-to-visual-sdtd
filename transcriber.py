@@ -350,6 +350,7 @@ class RealTimePipeline:
         self._failure_event = threading.Event()
         self.stop_event = threading.Event()
         self._worker_lock = threading.Lock()
+        self._osc_control_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._worker_threads = {}
         self._workers_started = False
@@ -1591,34 +1592,41 @@ class RealTimePipeline:
     def start_osc_control_server(self):
         if not self.osc_control_enabled:
             return
-        server = OscControlServer(
-            self.config.osc_control_ip,
-            self.config.osc_control_port,
-            self.apply_control,
-            self.osc_logger.warning,
-        )
-        try:
-            address = server.start()
-        except OSError as exc:
-            self.osc_logger.error(
-                "OSC control server could not bind",
+        # Keep construction, startup, and ownership registration atomic with
+        # close(), so a listener cannot become owned after cleanup has finished.
+        with self._osc_control_lock:
+            if self._backend_closed or not self.is_running:
+                raise RuntimeError("OSC controls cannot start after shutdown")
+            if self.osc_control_server is not None:
+                raise RuntimeError("OSC controls are already started")
+            server = OscControlServer(
+                self.config.osc_control_ip,
+                self.config.osc_control_port,
+                self.apply_control,
+                self.osc_logger.warning,
+            )
+            try:
+                address = server.start()
+            except OSError as exc:
+                self.osc_logger.error(
+                    "OSC control server could not bind",
+                    extra={
+                        "event": "osc_control_bind_error",
+                        "ip": self.config.osc_control_ip,
+                        "port": self.config.osc_control_port,
+                        "error": self.clean_audio_error(exc),
+                    },
+                )
+                return
+            self.osc_control_server = server
+            self.osc_logger.info(
+                "OSC control server listening",
                 extra={
-                    "event": "osc_control_bind_error",
-                    "ip": self.config.osc_control_ip,
-                    "port": self.config.osc_control_port,
-                    "error": self.clean_audio_error(exc),
+                    "event": "osc_control_listening",
+                    "ip": address[0],
+                    "port": address[1],
                 },
             )
-            return
-        self.osc_control_server = server
-        self.osc_logger.info(
-            "OSC control server listening",
-            extra={
-                "event": "osc_control_listening",
-                "ip": address[0],
-                "port": address[1],
-            },
-        )
 
     def apply_control(self, control_name, value):
         if control_name == "request_status":
@@ -1703,6 +1711,8 @@ class RealTimePipeline:
 
         try:
             self.start_osc_control_server()
+            if not self.is_running:
+                return
             self.start_worker_threads()
 
             print("\n" + "="*50)
@@ -1772,9 +1782,10 @@ class RealTimePipeline:
                 self.backend_status = "stopped"
                 self.is_speaking = False
                 self.send_runtime_status(force=True)
-            if self.osc_control_server is not None:
-                self.osc_control_server.stop()
-                self.osc_control_server = None
+            with self._osc_control_lock:
+                if self.osc_control_server is not None:
+                    self.osc_control_server.stop()
+                    self.osc_control_server = None
 
             self.join_worker_threads()
             self.backend_status = "stopped"

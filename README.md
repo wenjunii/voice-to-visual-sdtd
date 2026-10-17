@@ -447,6 +447,8 @@ Startup uses the same cleanup path. If a worker cannot be created or started, th
 
 If the OSC control thread cannot start, its bound UDP socket is released. An interrupted OSC startup also stops any control thread that already started, allowing the port to be reused. Ctrl+C during pipeline startup follows normal cooperative shutdown.
 
+OSC listener construction, startup, and ownership registration are serialized with shutdown. If an embedded caller closes the pipeline during OSC startup, cleanup waits for registration, stops the listener, and only then closes output, backend, and log resources. Cancellation during that startup step skips audio/transcription worker startup. Starting OSC controls again while a listener is already owned, or after shutdown has been requested, raises an error without opening or replacing a listener; disabled OSC controls remain a no-op.
+
 ### Resetting a Scene
 
 Send `/control/reset_scene` with any value to begin a fresh scene. Reset clears rolling scene memory, transcript stabilization, buffered speech and pre-roll, queued final segments, pending retries, and the pending partial snapshot. Audio reads already in progress at reset are discarded when they return; subsequent reads can begin new speech. WAV replay continues from its current position.
@@ -557,6 +559,8 @@ Online retry-timing tests cover invalid and overflowing numeric hints, HTTP date
 Runtime exit-code tests run the command entry point with real worker threads and simulated audio/backends. They cover audio open/read failures, both worker crash paths, failures during shutdown, normal Ctrl+C, completed replay, recovered microphone outages, and isolated transcription failures while verifying ordered cleanup and the final session log.
 
 Startup regression tests cover failure to create or start either worker, direct and command-line startup, interruption before and after a thread starts, concurrent startup/shutdown, and cleanup order. OSC tests verify that a failed control-thread startup releases its loopback port for reuse and that duplicate starts preserve the existing listener.
+
+OSC lifecycle tests use event-controlled startup pauses to cover concurrent shutdown during listener construction and startup, failed or interrupted starts, late and duplicate starts, and bind-failure recovery. A real loopback listener verifies that cancellation skips runtime workers, joins the OSC thread, releases its UDP port, and closes resources exactly once.
 
 WAV validation tests cover truncated headers and PCM payloads, incomplete multichannel frames, empty recordings, unsupported formats, malformed chunk boundaries, valid metadata padding, and resolved diagnostic paths (including Windows path aliases). Command-line tests verify early rejection without model initialization, single-load benchmark samples, unchanged warm-up/timing behavior, and cleanup after benchmark failures.
 
