@@ -539,12 +539,53 @@ python transcriber.py --backend whisper --benchmark .\sample.wav --benchmark-run
 
 The benchmark shares replay's validated PCM decoder and loads the recording once, before model initialization. It reuses those samples for one warm-up pass and all measured runs, then reports latency and real-time factor for each run. Invalid recordings exit with code `2` without loading a model. A real-time factor below `1.0` means transcription is faster than the recording duration.
 
-Run the streaming logic tests without loading a Whisper model:
+## Local-First Development
+
+Everyday development, tests, and Git history stay on your computer. GitHub is an optional, occasional backup and collaboration destination, not a requirement for running the project or validating changes. Sync only when requested; batch related changes instead of opening a pull request for every small improvement. The repository's `AGENTS.md` records this default for coding agents.
+
+Install the lightweight test dependencies once for the Python environment you use:
 
 ```powershell
-pip install -r requirements-test.txt
-python -m unittest discover -s tests -v
+python -m pip install -r requirements-test.txt
 ```
+
+Then run the local check after changes:
+
+```powershell
+python scripts/check_project.py
+```
+
+The checker compiles project modules, scripts, and tests in memory without importing runtime modules, then runs the unit suite using the same Python interpreter. It does not install packages, download models, call GitHub, or sync Git. Test dependencies must already be installed; missing dependencies produce an installation hint instead of an automatic download. The suite mocks hardware and hosted services; some OSC integration tests use local loopback UDP only. Add `--verbose` to list individual tests. The script also works when called by its absolute path from another working directory.
+
+Exit codes are `0` for success, `1` for syntax or test failures, `2` for missing prerequisites or a runner that cannot start, and `130` for Ctrl+C. An empty checkout or missing test files is an error.
+
+For a local Windows compatibility check, install `requirements-test.txt` in each interpreter once, then run:
+
+```powershell
+py -3.10 scripts/check_project.py
+py -3.11 scripts/check_project.py
+```
+
+Local Git commits preserve history without any network access. For a separate backup of committed history, you can create a portable bundle:
+
+```powershell
+git bundle create ..\voice-to-visual-backup.bundle --all
+git bundle verify ..\voice-to-visual-backup.bundle
+```
+
+Copy the bundle to a separate drive or backup location for protection against device loss. A bundle does not include uncommitted changes, untracked files, or ignored files such as `.env`; back up any needed local configuration separately and securely.
+
+### Optional GitHub Checks and Backup
+
+The tracked **Tests** workflow is manual-only: pushes and pull requests do not trigger it. When you choose to run it from GitHub's **Actions** tab, the default is one Ubuntu/Python 3.11 job. Select `full_matrix` for Windows and Ubuntu on Python 3.10 and 3.11. Both modes run the same local checker. Jobs have a ten-minute timeout, and a newer manual run cancels an older Tests run on the same branch. Local Windows tests alone do not verify Linux compatibility.
+
+When a GitHub backup is wanted, review and commit the intended files, then explicitly request a sync. Existing branch protections still apply; a pull request may be needed to update `main`. Avoid routine remote-status polling and API calls between backups.
+
+GitHub's server-side security features are separate from this YAML workflow. This repository has CodeQL default setup configured with a weekly schedule; it and other enabled server-side automation can still run independently. Those security settings and branch protections are intentionally unchanged. Eliminating *all* GitHub automation would require a separate settings decision.
+
+GitHub API quotas are separate from Actions usage. Standard GitHub-hosted Actions runners are currently free for public repositories such as this one; reducing runs mainly reduces activity and resource use, while avoiding repeated API queries reduces quota pressure. See [GitHub Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions). Package installation, initial model downloads, and online transcription providers have their own network requirements; a local-first development workflow does not remove those.
+
+### Regression Coverage
 
 Scene-reset regression tests cover queued and buffered speech, transcription completing across a reset, late retries and failures, audio capture crossing the reset boundary, and concurrent prompt publication. These tests use simulated backends and recorded OSC output without audio hardware or network requests.
 
@@ -564,7 +605,9 @@ OSC lifecycle tests use event-controlled startup pauses to cover concurrent shut
 
 WAV validation tests cover truncated headers and PCM payloads, incomplete multichannel frames, empty recordings, unsupported formats, malformed chunk boundaries, valid metadata padding, and resolved diagnostic paths (including Windows path aliases). Command-line tests verify early rejection without model initialization, single-load benchmark samples, unchanged warm-up/timing behavior, and cleanup after benchmark failures.
 
-Pull requests and updates to `main` run the same unit suite on Windows and Ubuntu with Python 3.10 and 3.11. The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
+Local-checker tests cover source selection, non-executing syntax checks, source encodings, missing prerequisites, interpreter and working-directory selection, verbose output, failure exit codes, interruption, and side-effect-free help.
+
+The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 
 ## License
 
