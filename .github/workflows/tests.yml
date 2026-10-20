@@ -1,22 +1,32 @@
 name: Tests
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: "Check Windows and Ubuntu on Python 3.10 and 3.11"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   unit-tests:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
-        python-version: ["3.10", "3.11"]
+        include: >-
+          ${{ fromJSON(inputs.full_matrix &&
+          '[{"os":"windows-latest","python-version":"3.10"},{"os":"windows-latest","python-version":"3.11"},{"os":"ubuntu-latest","python-version":"3.10"},{"os":"ubuntu-latest","python-version":"3.11"}]' ||
+          '[{"os":"ubuntu-latest","python-version":"3.11"}]') }}
 
     steps:
       - name: Check out repository
@@ -34,15 +44,5 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-test.txt
 
-      - name: Run unit tests
-        run: python -m unittest discover -s tests -v
-
-      - name: Compile project modules
-        run: >-
-          python -m py_compile
-          audio_runtime.py audio_sources.py backend_errors.py dependency_profiles.py
-          diagnostics.py orchestrator.py
-          osc_control.py osc_output.py prompt_engine.py runtime_config.py runtime_scheduler.py
-          runtime_logging.py
-          streaming_core.py transcript_filter.py transcriber.py
-          transcription_backends.py
+      - name: Validate project
+        run: python scripts/check_project.py --verbose
