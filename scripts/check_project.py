@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import importlib.util
+import io
+import math
+import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 from typing import Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TEST_RUNNER = Path(__file__).resolve().with_name("run_unit_tests.py")
+DEFAULT_TIMEOUT_SECONDS = 300.0
+PROCESS_CLEANUP_SECONDS = 5.0
 TEST_DEPENDENCIES = {
     "numpy": "numpy",
     "pythonosc": "python-osc",
@@ -58,7 +67,108 @@ def missing_dependencies() -> list[str]:
     return missing
 
 
-def validate(root: Path, *, verbose: bool = False) -> int:
+def positive_timeout(value: str) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            "timeout must be a finite number greater than zero"
+        ) from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            "timeout must be a finite number greater than zero"
+        )
+    return seconds
+
+
+def _stream_test_output(pipe, output, errors) -> None:
+    """Forward available chunks, including dots and lines without a newline."""
+    # Normalize CRLF before writing to a Windows text stream, which performs
+    # its own newline translation. Both UTF-8 and CRLF may cross chunk boundaries.
+    decoder = io.IncrementalNewlineDecoder(
+        codecs.getincrementaldecoder("utf-8")(errors="replace"), translate=True,
+    )
+    try:
+        with pipe:
+            while chunk := pipe.read1(4096):
+                output.write(decoder.decode(chunk))
+                output.flush()
+            output.write(decoder.decode(b"", final=True))
+            output.flush()
+    except Exception as exc:
+        errors.append(exc)
+
+
+def _stop_test_process(process) -> None:
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    process.wait(timeout=PROCESS_CLEANUP_SECONDS)
+
+
+def run_tests(root: Path, *, verbose: bool, timeout_seconds: float) -> int:
+    command = [sys.executable, "-u", str(TEST_RUNNER)]
+    if verbose:
+        command.append("--verbose")
+    environment = os.environ.copy()
+    environment["PYTHONIOENCODING"] = "utf-8"
+    deadline = time.monotonic() + timeout_seconds
+    # Explicit pipes work under Windows launchers without inheritable console
+    # handles. Unbuffered child output and a reader keep progress visible while
+    # the main thread independently enforces the deadline.
+    process = subprocess.Popen(
+        command, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, env=environment,
+    )
+    errors = []
+    reader = None
+    try:
+        try:
+            reader = threading.Thread(
+                target=_stream_test_output, args=(process.stdout, sys.stdout, errors),
+                name="local-check-output", daemon=True,
+            )
+            reader.start()
+        except RuntimeError as exc:
+            raise OSError(f"Could not start test output reader: {exc}") from exc
+        while True:
+            if errors:
+                raise OSError(f"Could not forward test output: {errors[0]}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            try:
+                code = process.wait(timeout=min(remaining, 0.05))
+            except subprocess.TimeoutExpired:
+                continue
+            reader.join(timeout=min(remaining, 0.05))
+            if not reader.is_alive():
+                if errors:
+                    raise OSError(f"Could not forward test output: {errors[0]}")
+                return code
+    finally:
+        try:
+            _stop_test_process(process)
+        finally:
+            if reader is not None and reader.ident is not None:
+                # An inherited output handle in a descendant must not make
+                # cancellation wait indefinitely. The daemon owns its pipe.
+                reader.join(timeout=1.0)
+            else:
+                process.stdout.close()
+
+
+def validate(
+    root: Path, *, verbose: bool = False,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> int:
+    try:
+        timeout_seconds = positive_timeout(str(timeout_seconds))
+    except argparse.ArgumentTypeError as exc:
+        print(f"Invalid timeout: {exc}", file=sys.stderr)
+        return 2
     print(f"Local validation with Python {sys.version.split()[0]}", flush=True)
     paths = source_files(root)
     if not paths:
@@ -84,30 +194,27 @@ def validate(root: Path, *, verbose: bool = False) -> int:
         )
         return 2
 
-    command = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
-    if verbose:
-        command.append("-v")
-    print("Running unit tests...", flush=True)
+    print(f"Running unit tests (timeout: {timeout_seconds:g}s)...", flush=True)
     try:
-        # Explicit pipes also work under Windows launchers without inheritable
-        # console handles. Keep test diagnostics visible on both success and failure.
-        result = subprocess.run(
-            command, cwd=root, check=False, capture_output=True,
-            text=True, errors="replace",
+        code = run_tests(
+            root, verbose=verbose, timeout_seconds=timeout_seconds,
         )
-    except OSError as exc:
-        print(f"Could not start the test runner: {exc}", file=sys.stderr)
-        return 2
-    if result.stdout:
-        print(result.stdout, end="", flush=True)
-    if result.stderr:
-        print(result.stderr, end="", file=sys.stderr, flush=True)
-    if result.returncode:
+    except subprocess.TimeoutExpired:
         print(
-            f"Unit tests failed (runner exit code {result.returncode}).",
+            f"\nUnit tests exceeded the {timeout_seconds:g}s timeout. "
+            "Validation failed; increase --timeout only if the suite needs more time.",
             file=sys.stderr,
         )
-        return 1
+        return 124
+    except OSError as exc:
+        print(f"Could not run the test runner: {exc}", file=sys.stderr)
+        return 2
+    if code:
+        print(
+            f"Unit tests failed (runner exit code {code}).",
+            file=sys.stderr,
+        )
+        return 130 if code == 130 else 1
     print("Local validation passed. No GitHub sync was performed.", flush=True)
     return 0
 
@@ -117,9 +224,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--verbose", action="store_true", help="show each unit test as it runs"
     )
+    parser.add_argument(
+        "--timeout", type=positive_timeout, default=DEFAULT_TIMEOUT_SECONDS,
+        metavar="SECONDS", help="test-run deadline in seconds (default: 300)",
+    )
     args = parser.parse_args(argv)
     try:
-        return validate(PROJECT_ROOT, verbose=args.verbose)
+        return validate(
+            PROJECT_ROOT, verbose=args.verbose, timeout_seconds=args.timeout,
+        )
     except KeyboardInterrupt:
         print("\nLocal validation interrupted.", file=sys.stderr)
         return 130

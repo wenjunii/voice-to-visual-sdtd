@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from scripts import check_project
+from scripts import run_unit_tests
 
 
 class LocalValidationTests(unittest.TestCase):
@@ -99,14 +100,14 @@ class LocalValidationTests(unittest.TestCase):
             )
 
     def test_empty_checkout_fails_without_starting_tests(self):
-        with mock.patch.object(check_project.subprocess, "run") as run:
+        with mock.patch.object(check_project, "run_tests") as run:
             self.assertEqual(check_project.validate(self.root), 2)
         run.assert_not_called()
         self.assertIn("No project Python files", self.output.getvalue())
 
     def test_missing_tests_fail_without_starting_runner(self):
         self.write_source("module.py")
-        with mock.patch.object(check_project.subprocess, "run") as run:
+        with mock.patch.object(check_project, "run_tests") as run:
             self.assertEqual(check_project.validate(self.root), 2)
         run.assert_not_called()
         self.assertIn("No discoverable test files", self.output.getvalue())
@@ -116,7 +117,7 @@ class LocalValidationTests(unittest.TestCase):
         self.write_source("module.py", "def broken(\n")
         with (
             mock.patch.object(check_project, "missing_dependencies") as dependencies,
-            mock.patch.object(check_project.subprocess, "run") as run,
+            mock.patch.object(check_project, "run_tests") as run,
         ):
             self.assertEqual(check_project.validate(self.root), 1)
         dependencies.assert_not_called()
@@ -128,7 +129,7 @@ class LocalValidationTests(unittest.TestCase):
             mock.patch.object(
                 check_project, "missing_dependencies", return_value=["python-osc"]
             ),
-            mock.patch.object(check_project.subprocess, "run") as run,
+            mock.patch.object(check_project, "run_tests") as run,
         ):
             self.assertEqual(check_project.validate(self.root), 2)
         run.assert_not_called()
@@ -136,24 +137,18 @@ class LocalValidationTests(unittest.TestCase):
         self.assertIn(sys.executable, self.output.getvalue())
         self.assertIn(str(self.root / "requirements-test.txt"), self.output.getvalue())
 
-    def test_success_uses_current_interpreter_and_explicit_working_directory(self):
+    def test_success_uses_local_runner_and_default_deadline(self):
         self.make_checkout()
         with (
             mock.patch.object(check_project, "missing_dependencies", return_value=[]),
             mock.patch.object(
-                check_project.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0),
+                check_project, "run_tests", return_value=0,
             ) as run,
         ):
             self.assertEqual(check_project.validate(self.root), 0)
         run.assert_called_once_with(
-            [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
-            cwd=self.root,
-            check=False,
-            capture_output=True,
-            text=True,
-            errors="replace",
+            self.root, verbose=False,
+            timeout_seconds=check_project.DEFAULT_TIMEOUT_SECONDS,
         )
         self.assertIn("Local validation passed", self.output.getvalue())
 
@@ -162,13 +157,13 @@ class LocalValidationTests(unittest.TestCase):
         with (
             mock.patch.object(check_project, "missing_dependencies", return_value=[]),
             mock.patch.object(
-                check_project.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 1),
+                check_project, "run_tests", return_value=1,
             ) as run,
         ):
-            self.assertEqual(check_project.validate(self.root, verbose=True), 1)
-        self.assertEqual(run.call_args.args[0][-1], "-v")
+            self.assertEqual(
+                check_project.validate(self.root, verbose=True, timeout_seconds=2.5), 1
+            )
+        run.assert_called_once_with(self.root, verbose=True, timeout_seconds=2.5)
         self.assertIn("Unit tests failed", self.output.getvalue())
         self.assertNotIn("Local validation passed", self.output.getvalue())
 
@@ -206,16 +201,18 @@ class LocalValidationTests(unittest.TestCase):
         with (
             mock.patch.object(check_project, "missing_dependencies", return_value=[]),
             mock.patch.object(
-                check_project.subprocess, "run", side_effect=OSError("cannot start")
+                check_project.subprocess, "Popen", side_effect=OSError("cannot start")
             ),
         ):
             self.assertEqual(check_project.validate(self.root), 2)
-        self.assertIn("Could not start the test runner", self.output.getvalue())
+        self.assertIn("Could not run the test runner", self.output.getvalue())
 
     def test_main_uses_script_location_and_forwards_verbose_flag(self):
         with mock.patch.object(check_project, "validate", return_value=0) as validate:
-            self.assertEqual(check_project.main(["--verbose"]), 0)
-        validate.assert_called_once_with(check_project.PROJECT_ROOT, verbose=True)
+            self.assertEqual(check_project.main(["--verbose", "--timeout", "12.5"]), 0)
+        validate.assert_called_once_with(
+            check_project.PROJECT_ROOT, verbose=True, timeout_seconds=12.5,
+        )
         self.assertEqual(
             check_project.PROJECT_ROOT,
             Path(check_project.__file__).resolve().parents[1],
@@ -232,6 +229,261 @@ class LocalValidationTests(unittest.TestCase):
                 check_project.main(["--help"])
         self.assertEqual(raised.exception.code, 0)
         validate.assert_not_called()
+
+    def test_main_uses_five_minute_default_timeout(self):
+        with mock.patch.object(check_project, "validate", return_value=0) as validate:
+            self.assertEqual(check_project.main([]), 0)
+        validate.assert_called_once_with(
+            check_project.PROJECT_ROOT, verbose=False, timeout_seconds=300.0,
+        )
+
+    def test_invalid_cli_timeouts_do_not_start_validation(self):
+        for value in ("0", "-1", "nan", "inf", "-inf", "1e309", "invalid"):
+            with self.subTest(value=value):
+                with mock.patch.object(check_project, "validate") as validate:
+                    with self.assertRaises(SystemExit) as raised:
+                        check_project.main([f"--timeout={value}"])
+                self.assertEqual(raised.exception.code, 2)
+                validate.assert_not_called()
+
+    def test_invalid_programmatic_timeouts_do_not_start_tests(self):
+        self.make_checkout()
+        for value in (0, -1, float("inf"), float("nan")):
+            with self.subTest(value=value):
+                with mock.patch.object(check_project, "run_tests") as run:
+                    self.assertEqual(
+                        check_project.validate(self.root, timeout_seconds=value), 2
+                    )
+                run.assert_not_called()
+
+    def test_timeout_reports_a_distinct_failure_exit_code(self):
+        self.make_checkout()
+        with (
+            mock.patch.object(check_project, "missing_dependencies", return_value=[]),
+            mock.patch.object(
+                check_project, "run_tests",
+                side_effect=subprocess.TimeoutExpired("runner", 1.5),
+            ),
+        ):
+            self.assertEqual(
+                check_project.validate(self.root, timeout_seconds=1.5), 124
+            )
+        self.assertIn("exceeded the 1.5s timeout", self.output.getvalue())
+        self.assertNotIn("Local validation passed", self.output.getvalue())
+
+    def test_child_interruption_is_not_reported_as_success(self):
+        self.make_checkout()
+        with (
+            mock.patch.object(check_project, "missing_dependencies", return_value=[]),
+            mock.patch.object(check_project, "run_tests", return_value=130),
+        ):
+            self.assertEqual(check_project.validate(self.root), 130)
+        self.assertNotIn("Local validation passed", self.output.getvalue())
+
+    def test_real_runner_rejects_test_files_with_no_test_cases(self):
+        self.make_checkout()
+        with mock.patch.object(check_project, "missing_dependencies", return_value=[]):
+            self.assertEqual(check_project.validate(self.root), 1)
+        self.assertIn("No tests discovered", self.output.getvalue())
+        self.assertNotIn("Local validation passed", self.output.getvalue())
+
+    def test_real_runner_rejects_a_load_tests_hook_that_removes_every_test(self):
+        self.make_checkout()
+        self.write_source(
+            "tests/test_example.py",
+            "import unittest\n"
+            "class ExampleTests(unittest.TestCase):\n"
+            "    def test_example(self):\n"
+            "        pass\n"
+            "def load_tests(loader, tests, pattern):\n"
+            "    return unittest.TestSuite()\n",
+        )
+        with mock.patch.object(check_project, "missing_dependencies", return_value=[]):
+            self.assertEqual(check_project.validate(self.root), 1)
+        self.assertIn("No tests discovered", self.output.getvalue())
+
+    def test_runner_rejects_custom_suites_that_claim_cases_but_run_none(self):
+        class CountOnlySuite(unittest.TestSuite):
+            def countTestCases(self):
+                return 1
+
+            def run(self, result, debug=False):
+                return result
+
+        with (
+            mock.patch.object(sys, "path", sys.path.copy()),
+            mock.patch.object(
+                unittest.TestLoader, "discover", return_value=CountOnlySuite()
+            ),
+        ):
+            self.assertEqual(run_unit_tests.main([]), 1)
+        self.assertIn("No tests ran", self.output.getvalue())
+
+    def test_real_runner_reports_discovery_errors(self):
+        self.make_checkout()
+        self.write_source(
+            "tests/test_example.py", "raise RuntimeError('discovery fixture failure')\n"
+        )
+        with mock.patch.object(check_project, "missing_dependencies", return_value=[]):
+            self.assertEqual(check_project.validate(self.root), 1)
+        self.assertIn("discovery fixture failure", self.output.getvalue())
+        self.assertNotIn("Local validation passed", self.output.getvalue())
+
+    def test_real_runner_streams_utf8_stderr_without_waiting_for_a_newline(self):
+        self.make_checkout()
+        acknowledgement = self.root / "progress-seen"
+
+        class ProgressOutput(io.StringIO):
+            def write(self, text):
+                count = super().write(text)
+                if "LIVE caf\u00e9 \u4f60\u597d" in self.getvalue():
+                    acknowledgement.write_text("seen", encoding="utf-8")
+                return count
+
+        self.write_source(
+            "tests/test_example.py",
+            "import sys, time, unittest\n"
+            "from pathlib import Path\n"
+            "class ExampleTests(unittest.TestCase):\n"
+            "    def test_progress(self):\n"
+            "        sys.stderr.write('LIVE caf\u00e9 \u4f60\u597d')\n"
+            "        sys.stderr.flush()\n"
+            "        deadline = time.monotonic() + 5\n"
+            "        while not Path('progress-seen').exists() and time.monotonic() < deadline:\n"
+            "            time.sleep(0.01)\n"
+            "        self.assertTrue(Path('progress-seen').exists(), 'output was buffered')\n",
+        )
+        progress = ProgressOutput()
+        with (
+            contextlib.redirect_stdout(progress),
+            mock.patch.object(check_project, "missing_dependencies", return_value=[]),
+        ):
+            self.assertEqual(check_project.validate(self.root, timeout_seconds=10), 0)
+        self.assertTrue(acknowledgement.exists())
+        self.assertIn("LIVE caf\u00e9 \u4f60\u597d", progress.getvalue())
+        self.assertIn("Ran 1 test", progress.getvalue())
+
+    def test_real_timeout_stops_and_reaps_discovery_or_test_process(self):
+        self.make_checkout()
+        sources = (
+            "import time\ntime.sleep(30)\n",
+            "import time, unittest\n"
+            "class ExampleTests(unittest.TestCase):\n"
+            "    def test_hang(self):\n"
+            "        time.sleep(30)\n",
+        )
+        real_popen = subprocess.Popen
+        for source in sources:
+            with self.subTest(source=source):
+                self.write_source("tests/test_example.py", source)
+                processes = []
+
+                def start(*args, **kwargs):
+                    process = real_popen(*args, **kwargs)
+                    processes.append(process)
+                    return process
+
+                with (
+                    mock.patch.object(check_project, "missing_dependencies", return_value=[]),
+                    mock.patch.object(check_project.subprocess, "Popen", side_effect=start),
+                ):
+                    self.assertEqual(
+                        check_project.validate(self.root, timeout_seconds=0.5), 124
+                    )
+                self.assertEqual(len(processes), 1)
+                self.assertIsNotNone(processes[0].poll())
+                self.assertTrue(processes[0].stdout.closed)
+
+    def test_runner_uses_current_interpreter_and_explicit_working_directory(self):
+        process = mock.Mock(stdout=io.BytesIO(b"test progress"))
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        with mock.patch.object(check_project.subprocess, "Popen", return_value=process) as start:
+            self.assertEqual(
+                check_project.run_tests(self.root, verbose=True, timeout_seconds=3), 0
+            )
+        self.assertEqual(
+            start.call_args.args[0],
+            [sys.executable, "-u", str(check_project.TEST_RUNNER), "--verbose"],
+        )
+        options = start.call_args.kwargs
+        self.assertEqual(options["cwd"], self.root)
+        self.assertEqual(options["stdin"], subprocess.DEVNULL)
+        self.assertEqual(options["stdout"], subprocess.PIPE)
+        self.assertEqual(options["stderr"], subprocess.STDOUT)
+        self.assertEqual(options["env"]["PYTHONIOENCODING"], "utf-8")
+        self.assertIn("test progress", self.output.getvalue())
+        self.assertTrue(process.stdout.closed)
+        process.kill.assert_not_called()
+
+    def test_interruption_stops_and_reaps_the_runner(self):
+        process = mock.Mock(stdout=io.BytesIO())
+        process.wait.side_effect = [KeyboardInterrupt, 0]
+        process.poll.return_value = None
+        with mock.patch.object(check_project.subprocess, "Popen", return_value=process):
+            with self.assertRaises(KeyboardInterrupt):
+                check_project.run_tests(self.root, verbose=False, timeout_seconds=3)
+        process.kill.assert_called_once_with()
+        self.assertEqual(
+            process.wait.call_args, mock.call(timeout=check_project.PROCESS_CLEANUP_SECONDS)
+        )
+        self.assertTrue(process.stdout.closed)
+
+    def test_output_reader_creation_or_start_failure_stops_the_runner(self):
+        for phase in ("create", "start"):
+            with self.subTest(phase=phase):
+                process = mock.Mock(stdout=io.BytesIO())
+                process.wait.return_value = 0
+                process.poll.return_value = None
+                target = "threading.Thread" if phase == "create" else "threading.Thread.start"
+                with (
+                    mock.patch.object(check_project.subprocess, "Popen", return_value=process),
+                    mock.patch(target, side_effect=RuntimeError("cannot start")),
+                ):
+                    with self.assertRaisesRegex(OSError, "Could not start test output reader"):
+                        check_project.run_tests(self.root, verbose=False, timeout_seconds=3)
+                process.kill.assert_called_once_with()
+                self.assertTrue(process.stdout.closed)
+
+    def test_output_read_failure_stops_the_runner(self):
+        class BrokenPipe(io.BytesIO):
+            def read1(self, size=-1):
+                raise OSError("broken output pipe")
+
+        process = mock.Mock(stdout=BrokenPipe())
+        process.wait.return_value = 0
+        process.poll.return_value = None
+        with mock.patch.object(check_project.subprocess, "Popen", return_value=process):
+            with self.assertRaisesRegex(OSError, "broken output pipe"):
+                check_project.run_tests(self.root, verbose=False, timeout_seconds=3)
+        process.kill.assert_called_once_with()
+        self.assertTrue(process.stdout.closed)
+
+    def test_stream_normalizes_split_utf8_and_windows_line_endings(self):
+        class ChunkedPipe(io.BytesIO):
+            def __init__(self):
+                super().__init__()
+                self.chunks = iter((b"caf\xc3", b"\xa9\r", b"\nnext\rline\n", b""))
+
+            def read1(self, size=-1):
+                return next(self.chunks)
+
+        pipe = ChunkedPipe()
+        output = io.StringIO()
+        errors = []
+        check_project._stream_test_output(pipe, output, errors)
+        self.assertEqual(output.getvalue(), "caf\u00e9\nnext\nline\n")
+        self.assertEqual(errors, [])
+        self.assertTrue(pipe.closed)
+
+    def test_stream_flushes_incomplete_utf8_without_losing_prior_output(self):
+        pipe = io.BytesIO(b"progress\n\xc3")
+        output = io.StringIO()
+        errors = []
+        check_project._stream_test_output(pipe, output, errors)
+        self.assertEqual(output.getvalue(), "progress\n\ufffd")
+        self.assertEqual(errors, [])
+        self.assertTrue(pipe.closed)
 
 
 if __name__ == "__main__":
