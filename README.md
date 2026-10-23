@@ -555,9 +555,15 @@ Then run the local check after changes:
 python scripts/check_project.py
 ```
 
-The checker compiles project modules, scripts, and tests in memory without importing runtime modules, then runs the unit suite using the same Python interpreter. It does not install packages, download models, call GitHub, or sync Git. Test dependencies must already be installed; missing dependencies produce an installation hint instead of an automatic download. The suite mocks hardware and hosted services; some OSC integration tests use local loopback UDP only. Add `--verbose` to list individual tests. The script also works when called by its absolute path from another working directory.
+The checker compiles project modules, scripts, and tests in memory without importing runtime modules, then runs the unit suite using the same Python interpreter. It does not install packages, download models, call GitHub, or sync Git. Test dependencies must already be installed; missing dependencies produce an installation hint instead of an automatic download. The suite mocks hardware and hosted services; some OSC integration tests use local loopback UDP only. Test output streams live, including progress dots; add `--verbose` to show each test name as it runs. Standard output and error are combined so failure details remain visible on Windows and other platforms. The script also works when called by its absolute path from another working directory.
 
-Exit codes are `0` for success, `1` for syntax or test failures, `2` for missing prerequisites or a runner that cannot start, and `130` for Ctrl+C. An empty checkout or missing test files is an error.
+The test subprocess has a five-minute (`300` second) deadline, including discovery and test execution. A timeout or Ctrl+C stops and reaps the runner, with a short bounded cleanup wait. This does not promise to terminate arbitrary subprocesses independently launched by tests. To allow a longer run, set a finite timeout greater than zero:
+
+```powershell
+python scripts/check_project.py --verbose --timeout 600
+```
+
+Exit codes are `0` for success, `1` for syntax or test failures (including zero discovered or executed tests), `2` for invalid options, missing prerequisites, or a runner/output failure, `124` for a test timeout, and `130` for Ctrl+C. An empty checkout or missing test files is an error. A file named `test_*.py` alone is not enough: the internal `scripts/run_unit_tests.py` entry point requires actual test cases and checks that the run executes at least one.
 
 For a local Windows compatibility check, install `requirements-test.txt` in each interpreter once, then run:
 
@@ -605,7 +611,7 @@ OSC lifecycle tests use event-controlled startup pauses to cover concurrent shut
 
 WAV validation tests cover truncated headers and PCM payloads, incomplete multichannel frames, empty recordings, unsupported formats, malformed chunk boundaries, valid metadata padding, and resolved diagnostic paths (including Windows path aliases). Command-line tests verify early rejection without model initialization, single-load benchmark samples, unchanged warm-up/timing behavior, and cleanup after benchmark failures.
 
-Local-checker tests cover source selection, non-executing syntax checks, source encodings, missing prerequisites, interpreter and working-directory selection, verbose output, failure exit codes, interruption, and side-effect-free help.
+Local-checker tests cover source selection, non-executing syntax checks, source encodings, missing prerequisites, interpreter and working-directory selection, live UTF-8 output without a trailing newline, verbose output, empty discovery and custom empty suites, discovery errors, timeout validation, hanging discovery and tests, process cleanup after timeouts, interruption and output-reader failures, failure exit codes, and side-effect-free help.
 
 The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 
