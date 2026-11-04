@@ -1,5 +1,6 @@
 import contextlib
 import io
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -195,6 +196,60 @@ class LocalValidationTests(unittest.TestCase):
         self.assertIn("Ran 1 test", self.output.getvalue())
         self.assertIn("AssertionError: deliberate fixture failure", self.output.getvalue())
         self.assertNotIn("Local validation passed", self.output.getvalue())
+
+    def test_validation_entry_points_leave_no_caches_on_success_or_failure(self):
+        self.make_checkout()
+        self.write_source("child_fixture.py", "value = 42\n")
+        # Existing caches and user/runtime files must survive validation intact.
+        preserved = {}
+        for relative_path in (
+            "__pycache__/unrelated.pyc", ".env", "recordings/input.wav",
+            "models/keep.bin", ".venv/keep.txt",
+        ):
+            path = self.root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"existing data")
+            preserved[path] = path.read_bytes()
+
+        environment = os.environ.copy()
+        # Exercise a caller that explicitly permits bytecode writes; each entry
+        # point must override that choice for its own tests and their children.
+        environment["PYTHONDONTWRITEBYTECODE"] = "0"
+        environment.pop("PYTHONPYCACHEPREFIX", None)
+        for entry_point in ("checker", "direct"):
+            for succeeds in (True, False):
+                with self.subTest(entry_point=entry_point, succeeds=succeeds):
+                    self.write_source(
+                        "tests/test_example.py",
+                        "import subprocess, sys, unittest\n"
+                        "import module\n"
+                        "class ExampleTests(unittest.TestCase):\n"
+                        "    def test_example(self):\n"
+                        "        subprocess.run([sys.executable, '-c', "
+                        "'import child_fixture'], check=True, timeout=5)\n"
+                        f"        self.assertTrue({succeeds!r})\n",
+                    )
+                    before = {p for p in self.root.rglob("*") if p.is_file()}
+                    if entry_point == "checker":
+                        with mock.patch.dict(os.environ, environment, clear=True):
+                            code = check_project.run_tests(
+                                self.root, verbose=False, timeout_seconds=10,
+                            )
+                    else:
+                        result = subprocess.run(
+                            [sys.executable, str(check_project.TEST_RUNNER)],
+                            cwd=self.root, env=environment, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            timeout=10,
+                        )
+                        code = result.returncode
+                    self.assertEqual(code, 0 if succeeds else 1)
+                    self.assertEqual(
+                        {p for p in self.root.rglob("*") if p.is_file()}, before,
+                    )
+                    self.assertEqual(
+                        {p: p.read_bytes() for p in preserved}, preserved,
+                    )
 
     def test_runner_start_failure_is_actionable(self):
         self.make_checkout()
@@ -404,7 +459,7 @@ class LocalValidationTests(unittest.TestCase):
             )
         self.assertEqual(
             start.call_args.args[0],
-            [sys.executable, "-u", str(check_project.TEST_RUNNER), "--verbose"],
+            [sys.executable, "-B", "-u", str(check_project.TEST_RUNNER), "--verbose"],
         )
         options = start.call_args.kwargs
         self.assertEqual(options["cwd"], self.root)
@@ -412,6 +467,7 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(options["stdout"], subprocess.PIPE)
         self.assertEqual(options["stderr"], subprocess.STDOUT)
         self.assertEqual(options["env"]["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(options["env"]["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertIn("test progress", self.output.getvalue())
         self.assertTrue(process.stdout.closed)
         process.kill.assert_not_called()

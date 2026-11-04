@@ -1,3 +1,24 @@
+# Working preferences
+
+## Automatic cleanup after tasks
+
+- The user authorizes routine cleanup of disposable files created or downloaded
+  for a task once verification is finished, without asking again. Include
+  one-off validation scripts, scratch files, completed installation archives,
+  abandoned partial downloads, and redundant task copies when no longer needed.
+- Verify exact targets and dependencies before removal. Limit cleanup to known
+  task artifacts; age or absence from the current workflow alone does not
+  establish that a file is unused.
+- When the user retires a workflow, also remove models downloaded exclusively
+  for it after checking for shared dependencies. Preserve active or shared
+  models, required tools and environments, source files, reference inputs, and
+  user outputs unless their removal is authorized.
+- Prefer the Recycle Bin when practical. Do not empty the Recycle Bin or
+  permanently remove unrelated files as part of routine cleanup.
+- Briefly report material cleanup, approximate size when useful, and whether
+  files are recoverable. Perform cleanup as part of task completion; this
+  preference does not create a background schedule.
+
 # Local-first project workflow
 
 - Develop, review, and test in this checkout by default. Local Git status, diffs,

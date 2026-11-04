@@ -581,6 +581,14 @@ git bundle verify ..\voice-to-visual-backup.bundle
 
 Copy the bundle to a separate drive or backup location for protection against device loss. A bundle does not include uncommitted changes, untracked files, or ignored files such as `.env`; back up any needed local configuration separately and securely.
 
+### Temporary Test Files and Cleanup
+
+Both validation entry points disable Python bytecode writes before test discovery. The checker also passes that setting to Python subprocesses started by tests, so successful and failed runs avoid leaving new `__pycache__` directories or `.pyc` files. Existing caches and runtime files are preserved. Tests that need scratch files use temporary directories and clean them up after the test.
+
+Coding agents clean up known disposable task artifacts after verification, including one-off validation scripts, redundant review checkouts, scratch files, and completed installation archives. Targets and dependencies must be checked first; a file's age alone does not make it disposable. Prefer the Recycle Bin when practical and report significant cleanup and recoverability. This is part of task completion, not a background cleanup schedule.
+
+Keep required Python environments, tools, active or shared models, source files, reference media, and user outputs. Models downloaded exclusively for an explicitly retired workflow can be removed after checking for shared dependencies. The checker does not install or uninstall packages or delete existing caches, environments, recordings, or models.
+
 ### Optional GitHub Checks and Backup
 
 The tracked **Tests** workflow is manual-only: pushes and pull requests do not trigger it. When you choose to run it from GitHub's **Actions** tab, the default is one Ubuntu/Python 3.11 job. Select `full_matrix` for Windows and Ubuntu on Python 3.10 and 3.11. Both modes run the same local checker. Jobs have a ten-minute timeout, and a newer manual run cancels an older Tests run on the same branch. Local Windows tests alone do not verify Linux compatibility.
@@ -611,7 +619,7 @@ OSC lifecycle tests use event-controlled startup pauses to cover concurrent shut
 
 WAV validation tests cover truncated headers and PCM payloads, incomplete multichannel frames, empty recordings, unsupported formats, malformed chunk boundaries, valid metadata padding, and resolved diagnostic paths (including Windows path aliases). Command-line tests verify early rejection without model initialization, single-load benchmark samples, unchanged warm-up/timing behavior, and cleanup after benchmark failures.
 
-Local-checker tests cover source selection, non-executing syntax checks, source encodings, missing prerequisites, interpreter and working-directory selection, live UTF-8 output without a trailing newline, verbose output, empty discovery and custom empty suites, discovery errors, timeout validation, hanging discovery and tests, process cleanup after timeouts, interruption and output-reader failures, failure exit codes, and side-effect-free help.
+Local-checker tests cover source selection, non-executing syntax checks, source encodings, missing prerequisites, interpreter and working-directory selection, live UTF-8 output without a trailing newline, verbose output, empty discovery and custom empty suites, discovery errors, timeout validation, hanging discovery and tests, process cleanup after timeouts, interruption and output-reader failures, failure exit codes, and side-effect-free help. Real subprocess checks verify that both validation entry points and their child Python imports leave no new cache files on success or failure while preserving existing caches and runtime files.
 
 The lightweight test requirements omit CUDA, Whisper, PyAudio, and StreamDiffusion because those hardware integrations are mocked in unit tests. The suite also validates the recursive dependency-profile graph and visual-runtime isolation, configuration and startup-profile isolation, command-line precedence, side-effect-free imports, exact and conservative prompt budgeting across Unicode input, WAV conversion and replay, the replay-to-OSC message sequence, OSC failure isolation and status throttling, microphone adapter cleanup and recovery, log rotation, credential redaction, interruptible cancellation, worker crashes, and ordered shutdown. `python transcriber.py --diagnose` remains available even when PyAudio is missing, so a new setup can report the selected profile, prompt-tokenizer readiness, and missing microphone dependency instead of failing during import.
 
