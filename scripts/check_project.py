@@ -109,11 +109,14 @@ def _stop_test_process(process) -> None:
 
 
 def run_tests(root: Path, *, verbose: bool, timeout_seconds: float) -> int:
-    command = [sys.executable, "-u", str(TEST_RUNNER)]
+    command = [sys.executable, "-B", "-u", str(TEST_RUNNER)]
     if verbose:
         command.append("--verbose")
     environment = os.environ.copy()
     environment["PYTHONIOENCODING"] = "utf-8"
+    # The flag covers this runner; the environment also covers Python children
+    # started by tests without carrying the runner's interpreter flags forward.
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     deadline = time.monotonic() + timeout_seconds
     # Explicit pipes work under Windows launchers without inheritable console
     # handles. Unbuffered child output and a reader keep progress visible while
