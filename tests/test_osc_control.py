@@ -1,11 +1,18 @@
+import socket
 import threading
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import Mock, patch
 
 from pythonosc import udp_client
+from pythonosc.osc_message import OscMessage
+from pythonosc.osc_message_builder import OscMessageBuilder
 from pythonosc.osc_server import ThreadingOSCUDPServer
 
 from osc_control import OscControlServer, normalize_control_value
+from osc_output import OscOutputPublisher
+from tests.test_transcriber_controls import make_pipeline
 
 
 class OscControlTests(unittest.TestCase):
@@ -95,6 +102,37 @@ class OscControlTests(unittest.TestCase):
             server.stop()
 
         self.assertEqual(received, [("language", "zh")])
+
+    def test_scene_request_resends_the_last_scene_over_loopback(self):
+        def receive(receiver, count):
+            messages = {}
+            for _ in range(count):
+                message = OscMessage(receiver.recv(4096))
+                messages[message.address] = message.params
+            return messages
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+            receiver.bind(("127.0.0.1", 0))
+            receiver.settimeout(2.0)
+            publisher = OscOutputPublisher(*receiver.getsockname())
+            self.addCleanup(publisher.close)
+            pipeline = make_pipeline(output_publisher=publisher)
+            self.addCleanup(pipeline.close)
+            server = OscControlServer("127.0.0.1", 0, pipeline.apply_control)
+            address = server.start()
+            try:
+                with redirect_stdout(StringIO()):
+                    pipeline.emit_transcript("neon city after rain", is_final=True)
+                original = receive(receiver, 6)
+                self.assertEqual(original.pop("/transcript_final"), ["neon city after rain"])
+                self.assertIn("neon city after rain", original["/prompt"][0])
+
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                    request = OscMessageBuilder(address="/control/request_scene").build()
+                    sender.sendto(request.dgram, address)
+                self.assertEqual(receive(receiver, 5), original)
+            finally:
+                server.stop()
 
 
 if __name__ == "__main__":

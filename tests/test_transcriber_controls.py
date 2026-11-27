@@ -13,7 +13,8 @@ from unittest.mock import Mock, patch
 
 from audio_sources import WavReplaySource
 from backend_errors import RetryableTranscriptionError
-from osc_output import RecordingOutputPublisher
+from osc_output import OscMessage, RecordingOutputPublisher
+from prompt_engine import ConservativeUtf8Tokenizer, PromptBudgeter
 from runtime_config import RuntimeConfig
 from transcriber import RealTimePipeline, load_runtime_config, main, parse_args
 
@@ -271,6 +272,68 @@ class RealTimePipelineControlTests(unittest.TestCase):
             for message in pipeline.recording_publisher.messages
         }
         self.assertTrue(expected.issubset(calls))
+
+
+class SceneRequestTests(unittest.TestCase):
+    def setUp(self):
+        self.publisher = RecordingOutputPublisher()
+        self.pipeline = make_pipeline(output_publisher=self.publisher)
+        self.addCleanup(self.pipeline.close)
+
+    def test_scene_request_uses_the_latest_prompt_after_a_visual_control_change(self):
+        pipeline = self.pipeline
+        pipeline.prompt_budgeter = PromptBudgeter(
+            [ConservativeUtf8Tokenizer()], max_tokens=512, mode="fallback",
+        )
+        with redirect_stdout(StringIO()):
+            pipeline.emit_transcript("morning forest", is_final=True)
+            pipeline.emit_transcript(
+                "morning forest beside a lake", raw_text="beside a lake",
+                is_final=True,
+            )
+            before_refresh = len(self.publisher.messages)
+            pipeline.apply_control("gender", "woman")
+        refreshed = {
+            message.address: message.value
+            for message in self.publisher.messages[before_refresh:]
+        }
+        self.assertIn("woman", refreshed["/prompt"])
+        self.assertGreater(refreshed["/prompt_tokens"], 0)
+
+        before_request = len(self.publisher.messages)
+        with patch.object(pipeline, "build_visual_prompt") as build:
+            pipeline.apply_control("request_scene", True)
+        build.assert_not_called()
+        pipeline.backend_adapter.transcribe.assert_not_called()
+        self.assertEqual(
+            self.publisher.messages[before_request:],
+            (
+                OscMessage("/prompt", refreshed["/prompt"]),
+                OscMessage("/partial_text", "beside a lake"),
+                OscMessage("/scene_context", "morning forest beside a lake"),
+                OscMessage("/prompt_tokens", refreshed["/prompt_tokens"]),
+                OscMessage("/prompt_budget_mode", "fallback"),
+            ),
+        )
+
+    def test_empty_scene_response_after_startup_and_reset(self):
+        for phase in ("startup", "reset"):
+            with self.subTest(phase=phase):
+                if phase == "reset":
+                    with redirect_stdout(StringIO()):
+                        self.pipeline.emit_transcript("a scene to clear")
+                    self.pipeline.apply_control("reset_scene", True)
+                before_request = len(self.publisher.messages)
+                self.pipeline.apply_control("request_scene", True)
+                self.assertEqual(
+                    self.publisher.messages[before_request:],
+                    (
+                        OscMessage("/partial_text", ""),
+                        OscMessage("/scene_context", ""),
+                        OscMessage("/prompt_tokens", 0),
+                        OscMessage("/prompt_budget_mode", "disabled"),
+                    ),
+                )
 
 
 class SchedulerOverflowLoggingTests(unittest.TestCase):

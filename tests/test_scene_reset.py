@@ -1,6 +1,7 @@
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import redirect_stdout
 from io import StringIO
 from unittest.mock import Mock
@@ -267,6 +268,44 @@ class SceneResetTests(unittest.TestCase):
                 ))
                 self.assertEqual(pipeline.last_text, "")
                 self.assertFalse(pipeline.refresh_visual_prompt())
+
+    def test_scene_request_cannot_resend_an_old_prompt_after_reset(self):
+        pipeline, publisher = self.make_pipeline()
+        with redirect_stdout(StringIO()):
+            pipeline.emit_transcript("old forest")
+        sending_prompt = threading.Event()
+        release_prompt = threading.Event()
+        reset_started = threading.Event()
+
+        def send(address, value):
+            if address == "/prompt":
+                sending_prompt.set()
+                if not release_prompt.wait(3.0):
+                    raise AssertionError("Scene response was not released")
+            return publisher.send(address, value)
+
+        def reset():
+            reset_started.set()
+            pipeline.apply_control("reset_scene", True)
+
+        pipeline.send_osc_message = send
+        before_request = len(publisher.messages)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            request = workers.submit(pipeline.apply_control, "request_scene", True)
+            try:
+                self.assertTrue(sending_prompt.wait(3.0))
+                resetting = workers.submit(reset)
+                self.assertTrue(reset_started.wait(3.0))
+                with self.assertRaises(FutureTimeoutError):
+                    resetting.result(timeout=0.1)
+            finally:
+                release_prompt.set()
+            request.result(timeout=3.0)
+            resetting.result(timeout=3.0)
+
+        addresses = [m.address for m in publisher.messages[before_request:]]
+        self.assertEqual(addresses.count("/prompt"), 1)
+        self.assertLess(addresses.index("/prompt"), addresses.index("/scene_reset"))
 
 
 if __name__ == "__main__":

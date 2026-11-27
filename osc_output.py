@@ -13,6 +13,17 @@ class OscMessage:
 
 
 @dataclass(frozen=True)
+class SceneOutputSnapshot:
+    """The most recent scene payload prepared for the receiver."""
+
+    prompt_budget_mode: str
+    prompt: str | None = None
+    partial_text: str = ""
+    scene_context: str = ""
+    prompt_tokens: int = 0
+
+
+@dataclass(frozen=True)
 class RuntimeStatusSnapshot:
     backend_status: str
     backend: str
