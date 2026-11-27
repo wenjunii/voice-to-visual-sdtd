@@ -13,6 +13,7 @@ CONTROL_ADDRESSES = {
     "/control/language": "language",
     "/control/reset_scene": "reset_scene",
     "/control/request_status": "request_status",
+    "/control/request_scene": "request_scene",
 }
 
 CONTROL_ALIASES = {
@@ -73,7 +74,7 @@ CONTROL_ALIASES = {
 
 
 def normalize_control_value(control_name, value):
-    if control_name in {"reset_scene", "request_status"}:
+    if control_name in {"reset_scene", "request_status", "request_scene"}:
         return True
     aliases = CONTROL_ALIASES.get(control_name)
     if aliases is None:

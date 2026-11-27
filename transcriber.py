@@ -32,6 +32,7 @@ from osc_output import (
     NullOutputPublisher,
     OscOutputPublisher,
     RuntimeStatusSnapshot,
+    SceneOutputSnapshot,
 )
 from prompt_engine import (
     ConservativeUtf8Tokenizer,
@@ -440,6 +441,9 @@ class RealTimePipeline:
         self.last_prompt_variant = "unbudgeted"
         self.last_prompt_trimmed = False
         self.last_text = ""
+        self._scene_output = SceneOutputSnapshot(
+            prompt_budget_mode=self.prompt_budget_mode,
+        )
         self.is_speaking = False
         self.audio_status = "starting"
         self.audio_reconnects = 0
@@ -1350,20 +1354,12 @@ class RealTimePipeline:
         if not text:
             return
         raw_text = raw_text or text
-        unchanged = text == self.last_text
-        if not unchanged:
-            self.last_text = text
-        if unchanged:
+        if text == self.last_text:
             if is_final:
                 self.send_osc_message("/transcript_final", raw_text)
             return
-        final_prompt = self.build_visual_prompt(text)
 
-        prompt_sent = self.send_osc_message("/prompt", final_prompt)
-        self.send_osc_message("/partial_text", raw_text)
-        self.send_osc_message("/scene_context", text)
-        self.send_osc_message("/prompt_tokens", self.last_prompt_token_count)
-        self.send_osc_message("/prompt_budget_mode", self.prompt_budget_mode)
+        prompt_sent = self._publish_scene_locked(text, raw_text=raw_text)
         if is_final:
             self.send_osc_message("/transcript_final", raw_text)
 
@@ -1395,10 +1391,7 @@ class RealTimePipeline:
         if not text:
             return False
 
-        final_prompt = self.build_visual_prompt(text)
-        prompt_sent = self.send_osc_message("/prompt", final_prompt)
-        self.send_osc_message("/prompt_tokens", self.last_prompt_token_count)
-        self.send_osc_message("/prompt_budget_mode", self.prompt_budget_mode)
+        prompt_sent = self._publish_scene_locked(text)
         self.prompt_logger.info(
             "Visual prompt refreshed after control change",
             extra={
@@ -1411,6 +1404,33 @@ class RealTimePipeline:
         )
         print(f"\n[PROMPT REFRESH]: Applied the current visual controls to: {text}")
         return True
+
+    def _publish_scene_locked(self, text, *, raw_text=None):
+        prompt = self.build_visual_prompt(text)
+        self.last_text = text
+        self._scene_output = SceneOutputSnapshot(
+            prompt=prompt,
+            partial_text=(
+                self._scene_output.partial_text if raw_text is None else raw_text
+            ),
+            scene_context=text,
+            prompt_tokens=self.last_prompt_token_count,
+            prompt_budget_mode=self.prompt_budget_mode,
+        )
+        # A visual control refresh keeps the last transcript and its wire format.
+        return self._send_scene_output_locked(include_text=raw_text is not None)
+
+    def _send_scene_output_locked(self, *, include_text=True):
+        snapshot = self._scene_output
+        prompt_sent = False
+        if snapshot.prompt is not None:
+            prompt_sent = self.send_osc_message("/prompt", snapshot.prompt)
+        if include_text:
+            self.send_osc_message("/partial_text", snapshot.partial_text)
+            self.send_osc_message("/scene_context", snapshot.scene_context)
+        self.send_osc_message("/prompt_tokens", snapshot.prompt_tokens)
+        self.send_osc_message("/prompt_budget_mode", snapshot.prompt_budget_mode)
+        return prompt_sent
 
     def build_visual_prompt(self, text):
         with self.state_lock:
@@ -1632,6 +1652,10 @@ class RealTimePipeline:
         if control_name == "request_status":
             self.send_runtime_status(force=True)
             return
+        if control_name == "request_scene":
+            with self.scene_lock:
+                self._send_scene_output_locked()
+            return
         if control_name == "reset_scene":
             self.reset_scene()
             return
@@ -1687,6 +1711,9 @@ class RealTimePipeline:
             self.stabilizers.clear()
             self.scene_memory.reset()
             self.last_text = ""
+            self._scene_output = SceneOutputSnapshot(
+                prompt_budget_mode=self.prompt_budget_mode,
+            )
             self.is_speaking = False
             self.last_prompt_token_count = 0
             self.last_prompt_variant = "reset"

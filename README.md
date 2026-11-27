@@ -431,7 +431,7 @@ If sending `/prompt` fails, the output publisher retains one pending prompt. New
 
 Only `/prompt` is retried. Transcript events, control acknowledgements, scene-context text, and other metadata retain their existing best-effort behavior; retries do not duplicate `/transcript_final` events. `osc_prompt_recovered` records that the latest pending prompt was successfully sent, separately from general socket recovery and without prompt text. The existing `prompt_emitted` and `prompt_refreshed` log events include `osc_sent` to distinguish an immediate successful send from a deferred or failed attempt.
 
-OSC uses UDP: a successful socket send is not an acknowledgement from TouchDesigner. This mechanism handles reported local send errors, not silent packet loss or an absent receiver; those require a receiver acknowledgement or explicit resynchronization protocol.
+OSC uses UDP, so a successful socket send does not confirm receipt. If TouchDesigner restarts or misses a prompt, it can request the current scene once its OSC input is listening again.
 
 ### Graceful Shutdown
 
@@ -507,8 +507,13 @@ Send these messages to `127.0.0.1:7001`. Text values accept the names below or t
 | `/control/language` | `en`, `zh`, `es`, `auto` |
 | `/control/reset_scene` | Any value; clears the scene and pending speech, and invalidates older in-flight transcription |
 | `/control/request_status` | Any value; immediately emits all runtime status addresses |
+| `/control/request_scene` | Any value or no arguments. Resends the latest scene output. |
 
 Accepted profile changes return `/control_ack`; scene resets emit `/scene_reset` after clearing the scene and pending speech. Gender, age, visual-mode, and prompt-style changes immediately resend `/prompt` using the current scene context. `/control/request_status` includes the five active control modes plus `/prompt_budget_mode` so a TouchDesigner interface can resynchronize after either process restarts.
+
+After TouchDesigner starts listening, send `/control/request_scene` to restore the latest `/prompt`, `/partial_text`, `/scene_context`, `/prompt_tokens`, and `/prompt_budget_mode`. The response reuses the last formatted prompt, including any visual control changes, and the last text sent with the scene. It leaves pending speech and scene memory intact. Requests use the same prompt retry rules and never replay `/transcript_final` or `/scene_reset` events.
+
+At startup and after a scene reset, empty `/partial_text` and `/scene_context` values and a zero token count indicate an empty scene. TouchDesigner can use the empty `/scene_context` to clear its display. Only a scene with a prompt includes a `/prompt` message. Send `/control/request_status` separately for runtime and control settings.
 
 ## Runtime Structure
 
